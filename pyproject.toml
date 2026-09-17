@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zcode-acp"
+version = "0.7.0"
+description = "Bridge ZCode's private app-server protocol to the Agent Client Protocol (ACP)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "zcode-acp contributors" }]
+keywords = ["acp", "agent-client-protocol", "zcode", "adapter", "json-rpc", "macos"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: User Interfaces",
+]
+
+[project.urls]
+Homepage = "https://github.com/Liang-HZ/zcode-acp"
+Source = "https://github.com/Liang-HZ/zcode-acp"
+Issues = "https://github.com/Liang-HZ/zcode-acp/issues"
+Related = "https://github.com/Liang-HZ/pulpo"
+
+[project.scripts]
+zcode-acp = "zcode_acp:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["zcode_acp.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

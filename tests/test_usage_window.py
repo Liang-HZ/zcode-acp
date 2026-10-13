@@ -1,10 +1,13 @@
-"""上下文圆环 size 的取值优先级 —— 不起引擎。
+"""usage_update 圆环口径 —— 不起引擎。
 
-引擎 3.15 的会话投影 contextWindow 只在会话创建/水合时写一次、之后换模型
-不更新（实测：create 的 `settings.model.available` 里 glm-5.3-flash=1000000，
-而 `session/read` 的 `projection.contextWindow` 与拼装出的 patch 恒为 200000）。
-客户端圆环按 `usage_update.size` 显示，所以适配器必须以 availability 的
-目录值为准——这三条用例锁住：目录命中 > 旧来源兜底 > 1M 默认。
+占用（used）只认引擎的占用口径：session/read 的 runtime.contextUsage.used
+（与 ZCode 桌面端圆环同源），projection.contextUsed 兜底；session/usage 的
+totalTokens 是任务累计口径，不许再当占用。size 依旧三级取值：目录 > 旧来源
+兜底 > 1M 默认。用例锁住：
+  - 占用取 runtime.contextUsage.used / projection.contextUsed；
+  - 圆环日志里混入累计值（模拟旧来源）也不得覆盖占用；
+  - 目录命中 > 旧来源兜底 > 1M 默认；
+  - 没有任何占用读数时 _fetch_usage 返回 None（不发帧）。
 """
 import threading
 
@@ -32,6 +35,12 @@ def _state_updated(cw):
                        "contextWindow": cw}]}}}}
 
 
+def _read_result(used=12345, cw=200000):
+    return {"id": 7, "result": {
+        "runtime": {"contextUsage": {"used": used, "size": cw}},
+        "projection": {"contextUsed": used, "contextWindow": cw}}}
+
+
 def test_capture_availability_extracts_settings_model(monkeypatch):
     monkeypatch.setattr(zcode_acp, "MODEL_AVAIL_LIST", [])
     zcode_acp.capture_availability({"settings": {"model": {"available": [
@@ -47,20 +56,48 @@ def test_catalog_window_wins_over_stale_projection(monkeypatch):
          "contextWindow": 1000000}])
     zc = _FakeEngine(log=[
         _state_updated(200000),
-        {"id": 1, "result": {"projection": {"contextWindow": 200000}}},
+        _read_result(used=12345, cw=200000),
     ])
     assert zc._fetch_usage()["size"] == 1000000
 
 
 def test_falls_back_to_old_sources_when_catalog_misses(monkeypatch):
     monkeypatch.setattr(zcode_acp, "MODEL_AVAIL_LIST", [])
-    zc = _FakeEngine(log=[
-        {"id": 1, "result": {"projection": {"contextWindow": 200000}}},
-    ])
-    assert zc._fetch_usage()["size"] == 200000
+    zc = _FakeEngine(log=[_read_result(used=12345, cw=200000)])
+    u = zc._fetch_usage()
+    assert u["size"] == 200000
+    assert u["used"] == 12345          # 占用口径，不是 session/usage 累计
 
 
 def test_defaults_to_one_million_without_any_source(monkeypatch):
     monkeypatch.setattr(zcode_acp, "MODEL_AVAIL_LIST", [])
-    zc = _FakeEngine(log=[{"id": 1, "result": {"projection": {}}}])
-    assert zc._fetch_usage()["size"] == 1000000
+    zc = _FakeEngine(log=[{"id": 1, "result": {"projection": {"contextUsed": 42}}}])
+    u = zc._fetch_usage()
+    assert u["size"] == 1000000
+    assert u["used"] == 42             # projection.contextUsed 兜底
+
+
+def test_used_prefers_occupancy_over_session_totals(monkeypatch):
+    """日志里混入累计值（旧来源 session/usage.totalTokens）也不得覆盖占用。"""
+    monkeypatch.setattr(zcode_acp, "MODEL_AVAIL_LIST", [])
+    zc = _FakeEngine(log=[
+        _read_result(used=209845, cw=1000000),
+        {"id": 9, "result": {"totalTokens": 987654}},      # 更新但只是累计值
+    ])
+    u = zc._fetch_usage()
+    assert u["used"] == 209845
+
+
+def test_no_reading_means_no_frame(monkeypatch):
+    monkeypatch.setattr(zcode_acp, "MODEL_AVAIL_LIST", [])
+    zc = _FakeEngine(log=[
+        {"id": 1, "result": {"runtime": {}}},
+        {"id": 2, "result": {"projection": {"contextWindow": 200000}}},
+    ])
+    assert zc._fetch_usage() is None
+
+
+def test_zero_used_is_not_a_reading(monkeypatch):
+    monkeypatch.setattr(zcode_acp, "MODEL_AVAIL_LIST", [])
+    zc = _FakeEngine(log=[_read_result(used=0)])
+    assert zc._fetch_usage() is None

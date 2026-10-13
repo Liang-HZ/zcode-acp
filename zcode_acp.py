@@ -530,6 +530,45 @@ def _v2_registry():
             "providers": providers}
 
 
+# ---------------------------------------------------------------- 用量口径
+#
+# 引擎的 session/usage 是**任务累计**口径（model_usage 逐请求求和），圆环占用
+# 走 session/read 的 runtime.contextUsage.used（桌面端同源）；ACP 的逐轮明细
+# （PromptResponse.usage，草案 RFD「End-Turn Token Usage」）用两者的差值。
+
+ENGINE_USAGE_COUNTERS = ("totalTokens", "inputTokens", "outputTokens",
+                         "reasoningTokens", "cacheCreationTokens",
+                         "cacheReadTokens")
+
+# 引擎计数器 → ACP 草案的字段名（camelCase）。
+USAGE_TO_ACP = {"totalTokens": "totalTokens",
+                "inputTokens": "inputTokens",
+                "outputTokens": "outputTokens",
+                "reasoningTokens": "thoughtTokens",
+                "cacheReadTokens": "cachedReadTokens",
+                "cacheCreationTokens": "cachedWriteTokens"}
+
+
+def usage_advanced(before, after):
+    """两次累计快照之间是否出现过新增（用于容忍引擎用量行的落库延迟）。"""
+    return any(int((after or {}).get(k, 0) or 0) !=
+               int((before or {}).get(k, 0) or 0) for k in ENGINE_USAGE_COUNTERS)
+
+
+def turn_usage_delta(before, after):
+    """引擎累计用量之差 → PromptResponse.usage（逐轮值）；无增量返回 None。
+
+    口径取逐轮差值：Codeg 按逐轮求和成会话总计、Zed（beta）直接显示本轮的
+    input/output、claude-agent-acp 同样上报逐轮——给累计值会被重复累加。"""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    out = {dst: max(0, int(after.get(src, 0) or 0) - int(before.get(src, 0) or 0))
+           for src, dst in USAGE_TO_ACP.items()}
+    if not any(out.values()):
+        return None
+    return out
+
+
 class ZCode:
     def __init__(self, cwd):
         self.cwd = cwd
@@ -2393,6 +2432,48 @@ class ZCode:
                     return cur["providerId"], cur["modelId"]
         return None
 
+    def query_usage(self, timeout=4):
+        """session/usage 原始应答（引擎口径的**会话累计**用量）；失败返回 None。
+
+        只用于两件事：给 PromptResponse.usage 取逐轮差值、探测引擎是否应答。
+        不要拿 totalTokens 当上下文占用——那是累计口径，占用见
+        _latest_context_used()。"""
+        rid = self.next_id; self.next_id += 1
+        self._send({"id": rid, "method": "session/usage",
+                    "params": {"sessionId": self.session_id}})
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                r = next((m for m in reversed(self.log) if m.get("id") == rid), None)
+            if r is not None and isinstance(r.get("result"), dict):
+                return r["result"]
+            time.sleep(0.3)
+        return None
+
+    def _latest_context_used(self):
+        """上下文占用（与 ZCode 桌面端圆环同口径）：最新一次 session/read 读数，
+        runtime.contextUsage.used 优先、projection.contextUsed 兜底。
+
+        两者都没有（首个模型请求完成前）返回 None——宁可不发 usage 帧，
+        也不拿 session/usage 的累计数冒充占用。"""
+        with self.lock:
+            for m in reversed(self.log):
+                res = m.get("result")
+                if not isinstance(res, dict):
+                    continue
+                runtime = res.get("runtime")
+                cu = runtime.get("contextUsage") if isinstance(runtime, dict) else None
+                if isinstance(cu, dict):
+                    u = cu.get("used")
+                    if isinstance(u, int) and u > 0:
+                        return u
+                proj = res.get("projection")
+                if isinstance(proj, dict):
+                    u = proj.get("contextUsed")
+                    if isinstance(u, int) and u > 0:
+                        return u
+        return None
+
     def _latest_usage_detail(self):
         """引擎的用量明细（cache 命中统计 + breakdown 占用分类）→ (cache, breakdown)。
 
@@ -2437,52 +2518,47 @@ class ZCode:
         return cache, breakdown
 
     def _fetch_usage(self):
-        """session/usage + 模型 contextWindow → usage_update 载荷（客户端上下文圆环）。"""
-        rid = self.next_id; self.next_id += 1
-        self._send({"id": rid, "method": "session/usage",
-                    "params": {"sessionId": self.session_id}})
-        deadline = time.time() + 4
-        while time.time() < deadline:
+        """上下文占用 + 模型 contextWindow → usage_update 载荷（客户端上下文圆环）。
+
+        used 用引擎自己的占用口径（session/read 的 runtime.contextUsage.used，
+        与 ZCode 桌面端圆环同源）。以前取 session/usage.totalTokens —— 那是
+        任务累计口径（含历史全部请求的输出），长会话会把圆环越推越高。
+        占用读数还没出现（首个模型请求完成前）就不发帧，而不是拿累计数冒充。"""
+        used = self._latest_context_used()
+        if used is None:
+            return None
+        size = None
+        # 1) 目录真值优先（见 MODEL_AVAIL_LIST 注释：引擎投影的
+        #    contextWindow 换模型不更新，会一直停在 2e5 默认值）。
+        cur_ref = self._current_model_ref()
+        if cur_ref:
+            size = catalog_context_window(*cur_ref)
+        # 2) 旧来源兜底：patch.model.available / session/read projection。
+        if size is None:
             with self.lock:
-                r = next((m for m in reversed(self.log) if m.get("id") == rid), None)
-            if r is not None and isinstance(r.get("result"), dict):
-                u = r["result"]
-                size = None
-                # 1) 目录真值优先（见 MODEL_AVAIL_LIST 注释：引擎投影的
-                #    contextWindow 换模型不更新，会一直停在 2e5 默认值）。
-                cur_ref = self._current_model_ref()
-                if cur_ref:
-                    size = catalog_context_window(*cur_ref)
-                # 2) 旧来源兜底：patch.model.available / session/read projection。
-                if size is None:
-                    with self.lock:
-                        for m in self.log:
-                            patch = (m.get("params") or {}).get("patch") or {}
-                            model = (patch.get("model") or {})
-                            cur = model.get("current") or {}
-                            if cur:
-                                for a in (model.get("available") or []):
-                                    if a.get("ref") == cur:
-                                        size = a.get("contextWindow")
-                            cw = (m.get("result", {}) or {}).get("projection", {}).get("contextWindow") \
-                                if isinstance(m.get("result"), dict) else None
-                            if size is None and cw:
-                                size = cw
-                # 3) 什么都没有时保留原来的 1M 兜底。
-                used = u.get("totalTokens", 0)
-                if not size:
-                    size = 1000000
-                payload = {"used": used, "size": size,
-                           "cost": {"amount": 0, "currency": "USD"}}
-                # 引擎明细随载荷带回（ACP 没有标准字段 → _meta.zcode，见 _send_usage）。
-                cache, breakdown = self._latest_usage_detail()
-                if cache:
-                    payload["cache"] = cache
-                if breakdown:
-                    payload["breakdown"] = breakdown
-                return payload
-            time.sleep(0.3)
-        return None
+                for m in self.log:
+                    patch = (m.get("params") or {}).get("patch") or {}
+                    model = (patch.get("model") or {})
+                    cur = model.get("current") or {}
+                    if cur:
+                        for a in (model.get("available") or []):
+                            if a.get("ref") == cur:
+                                size = a.get("contextWindow")
+                    cw = (m.get("result", {}) or {}).get("projection", {}).get("contextWindow") \
+                        if isinstance(m.get("result"), dict) else None
+                    if size is None and cw:
+                        size = cw
+        # 3) 什么都没有时保留原来的 1M 兜底。
+        if not size:
+            size = 1000000
+        payload = {"used": used, "size": size}
+        # 引擎明细随载荷带回（ACP 没有标准字段 → _meta.zcode，见 _send_usage）。
+        cache, breakdown = self._latest_usage_detail()
+        if cache:
+            payload["cache"] = cache
+        if breakdown:
+            payload["breakdown"] = breakdown
+        return payload
 
     def answer_permission(self, request_id, decision):
         self._send({"id": request_id, "result": {"decision": decision}})
@@ -2955,6 +3031,8 @@ class AcpServer:
 
         self.zcode.turn_active = True
         try:
+            # 本轮用量基线：PromptResponse.usage 用逐轮差值（见 _turn_usage）。
+            usage_before = self.zcode.query_usage() if rid is not None else None
             final = self.zcode.send(text, on_update=emit, thought_cb=think,
                                     usage_cb=lambda u: self._send_usage(sid_acp, u),
                                     tool_cb=tool_cb, subagent_cb=subagent_cb)
@@ -2962,8 +3040,11 @@ class AcpServer:
                 emit(final)
             stop = "cancelled" if (self.zcode._turn or {}).get("stopped") else "end_turn"
             if rid is not None:
-                self._send({"jsonrpc": "2.0", "id": rid,
-                            "result": {"stopReason": stop}})
+                result = {"stopReason": stop}
+                usage = self._turn_usage(usage_before)
+                if usage:
+                    result["usage"] = usage
+                self._send({"jsonrpc": "2.0", "id": rid, "result": result})
         except Exception as e:
             if rid is None:
                 log(f"detached turn error: {e}")
@@ -2974,17 +3055,36 @@ class AcpServer:
             # 轮已结束：之后来的权限请求一律直接拒绝，不再转发弹框
             self.zcode.turn_active = False
 
+    def _turn_usage(self, before):
+        """本轮用量的逐轮差值 → PromptResponse.usage。
+
+        引擎的 session/usage 是任务累计，客户端按逐轮账本结算（Codeg 求和、
+        Zed beta 直接显示本轮 input/output、claude-agent-acp 上报逐轮），
+        这里做差值。引擎用量行落库有轻微延迟：第一枪没变化就补一枪（0.5s），
+        避免本轮用量漏记到下一轮。无增量（本地命令轮）返回 None。"""
+        if not isinstance(before, dict):
+            return None
+        after = self.zcode.query_usage()
+        if isinstance(after, dict) and not usage_advanced(before, after):
+            time.sleep(0.5)
+            after = self.zcode.query_usage() or after
+        return turn_usage_delta(before, after)
+
     def _send_usage(self, sid_acp, u):
         """usage_update → 上下文圆环（used/size/cost 是 ACP 标准字段）。
 
         引擎的用量明细（缓存命中统计、占用分类 breakdown）在 ACP 里没有标准
         字段，按协议惯例挂在 `_meta.zcode.contextUsage`（不认识它的客户端会
         忽略）。明细只在**变化时**才带——usage 帧每几秒发一次，不去重会把
-        同一份 breakdown 反复写进客户端转录。"""
+        同一份 breakdown 反复写进客户端转录。
+
+        cost 只在引擎真的给出成本时才带：发 `{amount: 0}` 等于向客户端宣称
+        "免费"（RFD 里 cost 本就是 optional/nullable），宁缺毋假。"""
         update = {"sessionUpdate": "usage_update",
                   "used": u.get("used", 0),
-                  "size": u.get("size", 1000000),
-                  "cost": u.get("cost")}
+                  "size": u.get("size", 1000000)}
+        if u.get("cost"):
+            update["cost"] = u["cost"]
         meta = {}
         if isinstance(u.get("cache"), dict):
             meta["cache"] = u["cache"]

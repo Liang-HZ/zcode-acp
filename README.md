@@ -42,10 +42,29 @@ ACP 客户端  ──stdio/JSON-RPC──▶  zcode-acp  ──stdio/JSON-RPC─
 | 子代理 | 子会话的 `session/update` 流 | 经 V4 通道拿子会话的逐 token 思考/正文/工具入参回参 | 只能观测与取消（`session/cancelBackgroundTask`），不能向运行中的子代理注入消息 |
 | 安全模式 | `modes` + `session/set_mode` | `test_handshake.py::test_session_new_shape`：`default / acceptEdits / plan / bypassPermissions` ↔ 引擎 `build / edit / plan / yolo` | — |
 | 模型与推理强度 | `configOptions` + `session/set_config_option` | 同上用例：`supportsReasoningEffort` 对每个模型恒为真（引擎接受任意档位） | — |
-| 上下文用量 | `usage_update` | `session/usage` + 模型 `contextWindow` → 客户端圆环载荷 | 客户端需支持 `usage_update` |
+| 上下文用量 | `usage_update` + `PromptResponse.usage` | 圆环 `used/size`：占用口径（`session/read` 的 `runtime.contextUsage.used`，与 ZCode 桌面端圆环同源）+ 模型目录 `contextWindow`。逐轮明细：`session/usage` 累计差 → `usage{input,output,thought,cachedRead,cachedWrite}`（ACP 草案 RFD，camelCase），`test_turn_usage.py` 锁住 | 客户端需支持 `usage_update`；逐轮明细是草案字段，不认识它的客户端会忽略；引擎给不出成本 → `cost` 省略（不发 `amount:0`） |
 | 原生斜杠命令 | `availableCommands` | 实测引擎上报 4 条：`goal` / `compact` / `init` / `plan` | 走引擎原生方法，不进模型；命令由引擎侧决定 |
 | 结构化提问 | `elicitation/create` | 引擎 `interaction/requestUserInput` → ACP 表单 | 客户端需实现 `elicitation/create`；未实现或未应答 → 引擎侧收到 decline |
 | 一次性 CLI | `zcode-acp run` | `run_oneshot()`：opencode 兼容的 NDJSON 事件流（`step_start` / `text` / `step_finish`） | 该模式**自动放行全部权限**（不弹审批），只适合受控的无人值守场景 |
+
+### 用量与成本
+
+三条通道，各就各位：
+
+- **圆环（`usage_update` 的 `used/size`）**：占用口径。`used` 取引擎
+  `session/read` 的 `runtime.contextUsage.used`（与 ZCode 桌面端圆环同源），
+  `size` 取模型目录的 `contextWindow`（投影过时时不采信）。占用读数还没出现
+  （首个模型请求完成前）就不发帧——不用累计数冒充占用。
+- **逐轮明细（`PromptResponse.usage`）**：ACP 草案 RFD「End-Turn Token
+  Usage」的字段（camelCase：`totalTokens` / `inputTokens` / `outputTokens` /
+  `thoughtTokens` / `cachedReadTokens` / `cachedWriteTokens`），取引擎
+  `session/usage` 的**逐轮差值**——Codeg、Zed（beta）、claude-agent-acp 生态
+  都按逐轮账本结算，给累计值会被重复累加。不认识该字段的客户端会自动忽略。
+- **`_meta.zcode.contextUsage`**：引擎私有增强（缓存命中统计 `cache`、占用
+  分类 `breakdown`），标准里没有对应物，认识的客户端才消费。
+
+成本：引擎目前给不出真实成本，`usage_update.cost` 一律**省略**（RFD 里本就
+optional/nullable），绝不用 `{amount: 0}` 冒充“免费”。
 
 ### Getting Started
 
@@ -349,10 +368,34 @@ engine and a real model).
 | Subagents | child-session `session/update` stream | Token-level child thinking/text and full tool input/output over the V4 channel | Observable and cancellable (`session/cancelBackgroundTask`), but no way to inject a message into a running subagent |
 | Safety modes | `modes` + `session/set_mode` | `test_handshake.py::test_session_new_shape`: `default / acceptEdits / plan / bypassPermissions` ↔ engine `build / edit / plan / yolo` | — |
 | Model & reasoning effort | `configOptions` + `session/set_config_option` | Same test: `supportsReasoningEffort` is always true (the engine accepts any level) | — |
-| Context usage | `usage_update` | `session/usage` + the model's `contextWindow` → the client's usage ring | The client must support `usage_update` |
+| Context usage | `usage_update` + `PromptResponse.usage` | Ring `used/size`: engine occupancy (`session/read` → `runtime.contextUsage.used`, the same source the ZCode desktop ring uses) + the model catalog's `contextWindow`. Per-turn detail: `session/usage` cumulative deltas → `usage{input,output,thought,cachedRead,cachedWrite}` (draft RFD, camelCase), pinned by `test_turn_usage.py` | The client must support `usage_update`; the per-turn detail is a draft field clients may ignore; no real cost from the engine → `cost` is omitted (never `amount: 0`) |
 | Native slash commands | `availableCommands` | The engine reports 4: `goal` / `compact` / `init` / `plan` | They run as native engine methods, never hitting the model; the set is engine-defined |
 | Structured questions | `elicitation/create` | Engine `interaction/requestUserInput` → ACP form | The client must implement `elicitation/create`; if it does not (or does not answer), the engine receives a decline |
 | One-shot CLI | `zcode-acp run` | `run_oneshot()`: opencode-compatible NDJSON (`step_start` / `text` / `step_finish`) | **Auto-approves every permission** (no prompts); unattended use only |
+
+### Usage and cost
+
+Three channels, each in its own place:
+
+- **Ring (`usage_update.used/size`)**: occupancy. `used` comes from the engine's
+  `session/read` → `runtime.contextUsage.used` (the same source the ZCode desktop
+  ring uses); `size` comes from the model catalog's `contextWindow` (a stale
+  projection is not trusted). No reading yet (before the first model request
+  finishes) means no frame — never a cumulative number posing as occupancy.
+- **Per-turn detail (`PromptResponse.usage`)**: the draft ACP RFD
+  "End-Turn Token Usage" fields (camelCase: `totalTokens` / `inputTokens` /
+  `outputTokens` / `thoughtTokens` / `cachedReadTokens` / `cachedWriteTokens`),
+  computed as the per-turn **delta** of the engine's `session/usage` — Codeg,
+  Zed (beta) and the claude-agent-acp ecosystem all account per turn, and a
+  cumulative value would be double-counted. Clients that do not know the field
+  ignore it.
+- **`_meta.zcode.contextUsage`**: engine-private enrichment (cache-hit stats
+  `cache`, occupancy breakdown), with no standard counterpart; only clients that
+  know it consume it.
+
+Cost: the engine cannot provide a real cost today, so `usage_update.cost` is
+**omitted** (optional/nullable in the RFD) — never `{amount: 0}` pretending
+to be free.
 
 ### Getting Started
 

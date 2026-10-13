@@ -2393,6 +2393,49 @@ class ZCode:
                     return cur["providerId"], cur["modelId"]
         return None
 
+    def _latest_usage_detail(self):
+        """引擎的用量明细（cache 命中统计 + breakdown 占用分类）→ (cache, breakdown)。
+
+        来源优先级（实测结论）：
+        - breakdown：**ModelComplete 事件**（session/event 的 session.updated，
+          payload.contextUsageBreakdown = [{source, chars}]）——这是唯一可靠来源：
+          session/read 的 runtime.contextUsage 里它会被引擎的合并守卫吞掉
+          （投影 size 与事件 contextWindow 不一致时不合并）。
+        - cache：事件 payload.cacheHit 与 read 的 runtime.contextUsage.cache
+          同 schema，取最新出现的即可。
+        两者独立取"最新一次出现"，都没有则返回 (None, None)。"""
+        cache = None
+        breakdown = None
+        with self.lock:
+            for m in reversed(self.log):
+                if m.get("method") == "session/event":
+                    params = m.get("params") if isinstance(m.get("params"), dict) else {}
+                    payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+                    if breakdown is None:
+                        bd = payload.get("contextUsageBreakdown")
+                        if isinstance(bd, list) and bd:
+                            breakdown = bd
+                    if cache is None:
+                        ch = payload.get("cacheHit")
+                        if isinstance(ch, dict) and ch:
+                            cache = ch
+                else:
+                    res = m.get("result")
+                    if isinstance(res, dict):
+                        runtime = res.get("runtime") if isinstance(res.get("runtime"), dict) else {}
+                        cu = runtime.get("contextUsage") if isinstance(runtime.get("contextUsage"), dict) else {}
+                        if cache is None:
+                            c = cu.get("cache")
+                            if isinstance(c, dict) and c:
+                                cache = c
+                        if breakdown is None:
+                            bd = cu.get("breakdown")
+                            if isinstance(bd, list) and bd:
+                                breakdown = bd
+                if cache is not None and breakdown is not None:
+                    break
+        return cache, breakdown
+
     def _fetch_usage(self):
         """session/usage + 模型 contextWindow → usage_update 载荷（客户端上下文圆环）。"""
         rid = self.next_id; self.next_id += 1
@@ -2429,8 +2472,15 @@ class ZCode:
                 used = u.get("totalTokens", 0)
                 if not size:
                     size = 1000000
-                return {"used": used, "size": size,
-                        "cost": {"amount": 0, "currency": "USD"}}
+                payload = {"used": used, "size": size,
+                           "cost": {"amount": 0, "currency": "USD"}}
+                # 引擎明细随载荷带回（ACP 没有标准字段 → _meta.zcode，见 _send_usage）。
+                cache, breakdown = self._latest_usage_detail()
+                if cache:
+                    payload["cache"] = cache
+                if breakdown:
+                    payload["breakdown"] = breakdown
+                return payload
             time.sleep(0.3)
         return None
 
@@ -2449,6 +2499,7 @@ class AcpServer:
         self.acp_permission_waiters = {}
         self._out_lock = threading.Lock()   # 读者线程(事件)与 handle 线程共写 stdout
         self._prompt_lock = threading.Lock()  # 轮次串行:引擎拒绝 active 期间二次 send
+        self._last_usage_meta = None       # (sid, meta_json)：usage 明细去重哨兵
 
     def _deny_all_pending(self):
         """把所有还挂在客户端的权限请求按"取消"结算 —— 终止后弹着的框要收掉。"""
@@ -2924,13 +2975,28 @@ class AcpServer:
             self.zcode.turn_active = False
 
     def _send_usage(self, sid_acp, u):
-        """usage_update → 客户端上下文圆环（形状照 opencode）。"""
+        """usage_update → 上下文圆环（used/size/cost 是 ACP 标准字段）。
+
+        引擎的用量明细（缓存命中统计、占用分类 breakdown）在 ACP 里没有标准
+        字段，按协议惯例挂在 `_meta.zcode.contextUsage`（不认识它的客户端会
+        忽略）。明细只在**变化时**才带——usage 帧每几秒发一次，不去重会把
+        同一份 breakdown 反复写进客户端转录。"""
+        update = {"sessionUpdate": "usage_update",
+                  "used": u.get("used", 0),
+                  "size": u.get("size", 1000000),
+                  "cost": u.get("cost")}
+        meta = {}
+        if isinstance(u.get("cache"), dict):
+            meta["cache"] = u["cache"]
+        if isinstance(u.get("breakdown"), list) and u["breakdown"]:
+            meta["breakdown"] = u["breakdown"]
+        if meta:
+            fp = (sid_acp, json.dumps(meta, ensure_ascii=False, sort_keys=True))
+            if fp != self._last_usage_meta:
+                self._last_usage_meta = fp
+                update["_meta"] = {"zcode": {"contextUsage": meta}}
         self._send({"jsonrpc": "2.0", "method": "session/update", "params": {
-            "sessionId": sid_acp,
-            "update": {"sessionUpdate": "usage_update",
-                        "used": u.get("used", 0),
-                        "size": u.get("size", 1000000),
-                        "cost": u.get("cost")}}})
+            "sessionId": sid_acp, "update": update}})
 
     def _catalog_opts(self):
         return (getattr(self, "catalog", {}) or {}).get("configOptions") or []

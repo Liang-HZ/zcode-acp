@@ -148,6 +148,37 @@ def trace(msg):
         pass
 
 
+# 引擎 availability 快照（session/create|resume 的 settings.model.available）。
+# 模型真值窗口（contextWindow）从这里取，**不要**用 session 投影——实测引擎
+# 3.15 的投影 contextWindow 只在会话创建/水合时写一次、之后换模型不更新，
+# 会一直停在默认 200000（目录里 glm-5.3-flash=1000000，投影恒为 200000，
+# 客户端上下文圆环因此长期按 200K 算）。
+MODEL_AVAIL_LIST = []
+
+
+def capture_availability(result):
+    """session/create|resume 的 result → 记录引擎 availability（有序）。"""
+    try:
+        avail = ((((result or {}).get("settings") or {}).get("model") or {})
+                 .get("available") or [])
+        entries = [e for e in avail if isinstance(e, dict)]
+        if entries:
+            MODEL_AVAIL_LIST[:] = entries
+    except Exception as e:
+        log(f"availability capture failed: {e}")
+
+
+def catalog_context_window(provider_id, model_id):
+    """availability 里某模型的目录 contextWindow；缺失/非法返回 None。"""
+    for entry in list(MODEL_AVAIL_LIST):
+        ref = (entry.get("ref") or entry) if isinstance(entry, dict) else {}
+        if ref.get("providerId") == provider_id and ref.get("modelId") == model_id:
+            cw = entry.get("contextWindow")
+            if isinstance(cw, (int, float)) and cw > 0:
+                return int(cw)
+    return None
+
+
 # ---------------------------------------------------------------- ZCode client
 
 def zcode_model_catalog(current_mode="default"):
@@ -773,6 +804,12 @@ class ZCode:
             log(f"session/create 超时 {time.time()-t0:.1f}s（引擎未应答；"
                 f"引擎 stderr 见 {ENGINE_LOG_PATH}）")
             raise RuntimeError("zcode session/create failed")
+        # 目录真值快照：usage 圆环的 size 从这里取（见 MODEL_AVAIL_LIST 注释）。
+        with self.lock:
+            created = next((m for m in reversed(self.log)
+                            if m.get("id") == rid and isinstance(m.get("result"), dict)),
+                           None)
+        capture_availability((created or {}).get("result"))
         # 订阅实时事件流(桌面版同款通道):part.delta / model.streaming /
         # tool.updated / turn.completed … 全部从这里推送
         srid = self.next_id; self.next_id += 1
@@ -2336,6 +2373,26 @@ class ZCode:
                 log(f"on_stop callback failed: {e}")
         threading.Thread(target=self._hard_stop_later, daemon=True).start()
 
+    def _current_model_ref(self):
+        """日志里最新的"当前模型"引用 (providerId, modelId)。
+
+        来源优先级：state.updated 的 patch.model.current（换模型后即到）、
+        其次 create/read 结果的 settings.model.current。"""
+        with self.lock:
+            for m in reversed(self.log):
+                params = m.get("params") if isinstance(m.get("params"), dict) else {}
+                patch = params.get("patch") if isinstance(params.get("patch"), dict) else {}
+                model = patch.get("model") if isinstance(patch.get("model"), dict) else {}
+                cur = model.get("current") if isinstance(model.get("current"), dict) else {}
+                if not (cur.get("providerId") and cur.get("modelId")):
+                    result = m.get("result") if isinstance(m.get("result"), dict) else {}
+                    settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+                    rmodel = settings.get("model") if isinstance(settings.get("model"), dict) else {}
+                    cur = rmodel.get("current") if isinstance(rmodel.get("current"), dict) else {}
+                if cur.get("providerId") and cur.get("modelId"):
+                    return cur["providerId"], cur["modelId"]
+        return None
+
     def _fetch_usage(self):
         """session/usage + 模型 contextWindow → usage_update 载荷（客户端上下文圆环）。"""
         rid = self.next_id; self.next_id += 1
@@ -2348,19 +2405,27 @@ class ZCode:
             if r is not None and isinstance(r.get("result"), dict):
                 u = r["result"]
                 size = None
-                with self.lock:
-                    for m in self.log:
-                        patch = (m.get("params") or {}).get("patch") or {}
-                        model = (patch.get("model") or {})
-                        cur = model.get("current") or {}
-                        if cur:
-                            for a in (model.get("available") or []):
-                                if a.get("ref") == cur:
-                                    size = a.get("contextWindow")
-                        cw = (m.get("result", {}) or {}).get("projection", {}).get("contextWindow") \
-                            if isinstance(m.get("result"), dict) else None
-                        if size is None and cw:
-                            size = cw
+                # 1) 目录真值优先（见 MODEL_AVAIL_LIST 注释：引擎投影的
+                #    contextWindow 换模型不更新，会一直停在 2e5 默认值）。
+                cur_ref = self._current_model_ref()
+                if cur_ref:
+                    size = catalog_context_window(*cur_ref)
+                # 2) 旧来源兜底：patch.model.available / session/read projection。
+                if size is None:
+                    with self.lock:
+                        for m in self.log:
+                            patch = (m.get("params") or {}).get("patch") or {}
+                            model = (patch.get("model") or {})
+                            cur = model.get("current") or {}
+                            if cur:
+                                for a in (model.get("available") or []):
+                                    if a.get("ref") == cur:
+                                        size = a.get("contextWindow")
+                            cw = (m.get("result", {}) or {}).get("projection", {}).get("contextWindow") \
+                                if isinstance(m.get("result"), dict) else None
+                            if size is None and cw:
+                                size = cw
+                # 3) 什么都没有时保留原来的 1M 兜底。
                 used = u.get("totalTokens", 0)
                 if not size:
                     size = 1000000
@@ -3115,6 +3180,7 @@ class AcpServer:
             zc._turn = None
             # resume 的会话是从引擎 store 里取出来的 → session 行必然已在库里
             zc._persisted.set()
+            capture_availability(r)
             self._subscribe(zsid)
             self.acp_session = f"zc-{zsid}"
             cat = zcode_model_catalog(self.permission_mode)

@@ -19,6 +19,21 @@ import uuid
 ZC_CJS = os.environ.get(
     "ZCODE_CJS", "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+
+def _engine_env():
+    """桥同款引擎环境（`zcode_acp.engine_env()`）。
+
+    ZCode 3.12.3+ 的内置 CLI 需要宿主注入 provider 表，缺失时引擎以
+    「无法定位 CLI ZCode Built-in Provider Config」立即退出——探针用裸
+    `os.environ` 拉起会 BrokenPipe。探针必须与桥（以及真实客户端里跑出来的
+    进程）用同一套环境，否则本地全量测试会死在探活这一步。"""
+    import zcode_acp
+    return zcode_acp.engine_env()
+
 
 def _node():
     for cand in (os.environ.get("ZCODE_NODE"), "/usr/local/bin/node",
@@ -35,6 +50,7 @@ def check(model, budget=60):
     nid = [900]
     slock = threading.Lock()
     proc = subprocess.Popen([_node(), ZC_CJS, "app-server", "--stdio"], cwd=cwd,
+                            env=_engine_env(),
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
 

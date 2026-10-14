@@ -4731,7 +4731,7 @@ class AcpServer:
 def main():
     argv = sys.argv[1:]
     if "--version" in argv or "-v" in argv:
-        print("zcode-acp 0.9.0 (local bridge to ZCode app-server; 事件驱动流式+claude 卡片契约+子代理V4实时流+_session/steering guide 注入+落盘时序对齐+终端登录向导+引擎注册表/订阅权益目录)")
+        print("zcode-acp 0.9.1 (local bridge to ZCode app-server; 事件驱动流式+claude 卡片契约+子代理V4实时流/父会话归属契约+_session/steering guide 注入+落盘时序对齐+终端登录向导+引擎注册表/订阅权益目录)")
         return
     # Terminal Auth 入口：`--login` / `--setup`（initialize 的 authMethods
     # 里声明就是它）——安装/登录向导，做完即退出，不进 ACP 服务循环。

@@ -84,14 +84,14 @@ optional/nullable），绝不用 `{amount: 0}` 冒充“免费”。
 
 ```bash
 pipx install git+https://github.com/Liang-HZ/zcode-acp
-zcode-acp --version        # zcode-acp 0.9.0
+zcode-acp --version        # zcode-acp 0.9.1
 ```
 
 也可以免安装直接跑（uv 用户；ACP 客户端里 command 填 `uvx`、args 填
-`--from zcode-acp==0.9.0 zcode-acp` 即可）：
+`--from zcode-acp==0.9.1 zcode-acp` 即可）：
 
 ```bash
-uvx --from zcode-acp==0.9.0 zcode-acp
+uvx --from zcode-acp==0.9.1 zcode-acp
 ```
 
 不想装也可以直接用仓库里的启动器（它把仓库根加进 `sys.path`，不需要安装）：
@@ -424,14 +424,14 @@ to be free.
 
 ```bash
 pipx install git+https://github.com/Liang-HZ/zcode-acp
-zcode-acp --version        # zcode-acp 0.9.0
+zcode-acp --version        # zcode-acp 0.9.1
 ```
 
 Or run it without installing (uv users; point an ACP client's command at `uvx`
-with args `--from zcode-acp==0.9.0 zcode-acp`):
+with args `--from zcode-acp==0.9.1 zcode-acp`):
 
 ```bash
-uvx --from zcode-acp==0.9.0 zcode-acp
+uvx --from zcode-acp==0.9.1 zcode-acp
 ```
 
 Prefer no install? Run the launcher straight from a checkout (it puts the repo root on

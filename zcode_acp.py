@@ -1104,8 +1104,8 @@ def _tool_acp_update(tool_key, info, tool_names):
 
 
 def _is_subagent_tool(info):
-    """子代理派发工具（Task/Agent）：主会话不出卡（claude-acp 同款——
-    由 subagent_spawned + 子会话流呈现）。"""
+    """子代理派发工具（Task/Agent）：内容流不出卡（claude-acp 同款——
+    子代理的过程由父会话归属流收进它自己的 Agent 胶囊；嵌套派发一并跳过）。"""
     name = (info.get("name") or "").lower()
     return info.get("source") == "subagent" or name in ("task", "agent")
 
@@ -2180,6 +2180,11 @@ class ZCode:
         out = []
         with self.child_lock:
             out = self._child_tool_apply_locked(ch, ctid, name, kind, input_, ok, output)
+            # 归属随数据帧走：subagent_cb 在 _run_prompt 作用域（看不到本轮
+            # st），父调用 id（引擎原始 toolCallId）从子会话登记表带出。
+            pid = ch.get("parent_tool_call_id") or ""
+            for d in out:
+                d["parentToolCallId"] = pid
         return out
 
     def _child_tool_apply_locked(self, ch, ctid, name, kind, input_=None,
@@ -2314,7 +2319,8 @@ class ZCode:
                 return []
             led["buf"] = text
             led["sent"] = max(led["sent"], len(text))
-            return [(kind, {"text": delta})]
+            return [(kind, {"text": delta,
+                            "parentToolCallId": ch.get("parent_tool_call_id") or ""})]
 
     def _stream_append(self, ch, kind, eid, append):
         """增量入账（V4 row.delta）。返回待发事件列表。"""
@@ -2326,7 +2332,8 @@ class ZCode:
             if len(led["buf"]) > led["sent"]:
                 delta = led["buf"][led["sent"]:]
                 led["sent"] = len(led["buf"])
-                return [(kind, {"text": delta})]
+                return [(kind, {"text": delta,
+                                "parentToolCallId": ch.get("parent_tool_call_id") or ""})]
         return []
 
     def _v4_row_upsert(self, ch, row):
@@ -2865,7 +2872,9 @@ class ZCode:
             has_text = any(k.startswith("text:") for k in ch["stream"])
             ch["summary_sent"] = True
             if not has_text:
-                subagent_cb("text", zid, {"text": summary})
+                subagent_cb("text", zid, {"text": summary,
+                                           "parentToolCallId":
+                                               ch.get("parent_tool_call_id") or ""})
 
     def child_read(self, zsid, timeout=12):
         """读任意引擎会话会话转录（子会话需先 resume 激活）。"""
@@ -2894,14 +2903,17 @@ class ZCode:
         ch = st["children"].get(zid)
         if not ch:
             return
+        pid = ch.get("parent_tool_call_id") or ""
         et = params.get("type")
         pl = params.get("payload") or {}
         if et == "model.streaming":
             k = pl.get("kind")
             if k in ("reasoning_start", "reasoning_delta") and pl.get("delta"):
-                subagent_cb("thought", zid, {"text": pl["delta"]})
+                subagent_cb("thought", zid, {"text": pl["delta"],
+                                              "parentToolCallId": pid})
             elif k == "text_delta" and pl.get("delta"):
-                subagent_cb("text", zid, {"text": pl["delta"]})
+                subagent_cb("text", zid, {"text": pl["delta"],
+                                           "parentToolCallId": pid})
             elif k in ("tool_input_start", "tool_input_delta", "tool_input_end"):
                 cur = ch.setdefault("tools", {}).setdefault(
                     pl.get("toolCallId") or "?", {})
@@ -2919,7 +2931,8 @@ class ZCode:
                     subagent_cb("tool", zid, {"name": cur.get("name") or "tool",
                                                "phase": "scheduled",
                                                "input": cur.get("input"),
-                                               "tid": pl.get("toolCallId")})
+                                               "tid": pl.get("toolCallId"),
+                                               "parentToolCallId": pid})
         elif et == "tool.updated":
             k = pl.get("kind")
             tid = pl.get("toolCallId")
@@ -2931,13 +2944,15 @@ class ZCode:
             if k in ("scheduled", "started", "tool_call"):
                 subagent_cb("tool", zid, {"name": cur["name"],
                                            "phase": "started" if k == "started" else "scheduled",
-                                           "input": pl.get("input"), "tid": tid})
+                                           "input": pl.get("input"), "tid": tid,
+                                           "parentToolCallId": pid})
             elif k == "result":
                 res = pl.get("result") or {}
                 subagent_cb("tool", zid, {"name": cur["name"], "phase": "result",
                                            "ok": res.get("success", True),
                                            "output": str(res.get("content") or ""),
-                                           "tid": tid})
+                                           "tid": tid,
+                                           "parentToolCallId": pid})
         elif et == "session.titleUpdated":
             t = pl.get("title")
             if t:
@@ -3907,22 +3922,46 @@ class AcpServer:
 
         def tool_cb(tool_key, info):
             """ZCode 工具轨迹 → ACP tool_call 卡片(契约=claude-agent-acp)。
-            子代理派发卡保留:app-server 传输拿不到子会话流(订阅/read 均
-            "Session is not active"),Task 卡的任务描述+子代理回报就是
-            主时间线里可得的全部细节;右侧面板由 subagent_spawned 另行呈现。"""
+            子代理派发卡保留: Task 卡的任务描述+子代理回报是主时间线里
+            可得的全部细节;子代理的过程(思考/工具卡)走 subagent_cb 的
+            父会话归属流,收进这张卡的胶囊里。"""
             upd = _tool_acp_update(tool_key, info, tool_names)
             self._send({"jsonrpc": "2.0", "method": "session/update",
                         "params": {"sessionId": sid_acp, "update": upd}})
 
         def subagent_cb(action, zid, data):
-            """引擎子会话 → 客户端子代理面板(claude-acp 线协议):
-            spawn/state 落在父会话,内容流(思考/正文/工具卡)落在
-            zcsub-<子会话id> 自己的 ACP 会话 id 下——客户端按
-            subagentSessionId 关联路由。
+            """引擎子会话 → 父会话归属流（codeg 的 claude-acp 同款契约）。
+
+            子代理的思考/正文/工具卡全部以**父会话 id** 发出，并挂
+            `_meta.zcode.parentToolUseId`（= 父会话 Agent 卡的 toolCallId，
+            即 f"zc-{引擎 toolCallId}"）——客户端据此把内容收进那张 Agent
+            胶囊（codeg：Rust 归属提取 → 前端 capsule 嵌套，与 Claude/CodeBuddy
+            同一条消费链）。spawn/state 生命周期仍按草稿版 RFD 形状在父会话上
+            宣告（不认识的客户端忽略即可）。
+
+            改动缘由（2026-10-14，conv 84 判障）：原先"内容流落
+            zcsub-<子会话>"的形态只有支持草稿版 ACP 子代理会话的客户端能消费；
+            codeg 0.35 不认（subagent_spawned/state_update 被整条丢弃、zcsub-
+            无会话可路由）→ 子代理全程零回传、派发卡干转成"转圈"。改父会话
+            归属后，过程实时进胶囊、收尾/历史同一条链。
+
+            父调用 id 随 data["parentToolCallId"] 走（ZCode 侧的登记表在
+            每个数据帧带出——本回调在 _run_prompt 作用域，看不到本轮 st）。
 
             数据源=子会话 resume 激活后的持久化转录(思考/正文/工具全文)
             + 父流上 source="subagent" 的 tool.updated(带完整 input/output)。"""
             child_sid = f"zcsub-{zid}"
+            raw_pid = data.get("parentToolCallId") or ""
+            parent_use_id = ""
+            if raw_pid:
+                parent_use_id = raw_pid if raw_pid.startswith("zc-") else f"zc-{raw_pid}"
+
+            def zmeta(tool_name=None):
+                m = {"parentToolUseId": parent_use_id, "childSessionId": zid}
+                if tool_name:
+                    m["toolName"] = tool_name
+                return {"zcode": m}
+
             if action == "spawn":
                 log(f"subagent spawned: {child_sid} {data.get('name', '')[:40]}")
                 self._send({"jsonrpc": "2.0", "method": "session/update", "params": {
@@ -3939,27 +3978,38 @@ class AcpServer:
                     "update": {"sessionUpdate": "subagent_state_update",
                                 "subagentSessionId": child_sid,
                                 "state": data.get("state") or "completed"}}})
-            elif action == "thought":
+            elif action in ("thought", "text"):
+                if not parent_use_id:
+                    # 父调用 id 未知（罕见：发现路径未带归属）→ 不落主时间线
+                    # 污染，丢弃一次记一笔日志；后续事件带 id 后自动恢复。
+                    if zid not in no_parent_logged:
+                        no_parent_logged.add(zid)
+                        log(f"subagent content without parent id, dropped: {child_sid}")
+                    return
                 self._send({"jsonrpc": "2.0", "method": "session/update", "params": {
-                    "sessionId": child_sid,
-                    "update": {"sessionUpdate": "agent_thought_chunk",
-                                "content": {"type": "text",
-                                             "text": data.get("text") or ""}}}})
-            elif action == "text":
-                self._send({"jsonrpc": "2.0", "method": "session/update", "params": {
-                    "sessionId": child_sid,
-                    "update": {"sessionUpdate": "agent_message_chunk",
-                                "content": {"type": "text",
-                                             "text": data.get("text") or ""}}}})
+                    "sessionId": sid_acp,
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk" if action == "thought"
+                                          else "agent_message_chunk",
+                        "content": {"type": "text", "text": data.get("text") or ""},
+                        "_meta": zmeta()}}})
             elif action == "tool":
                 if _is_subagent_tool(data) or (data.get("name") or "").lower() in ("task", "agent"):
                     return
+                if not parent_use_id:
+                    if zid not in no_parent_logged:
+                        no_parent_logged.add(zid)
+                        log(f"subagent content without parent id, dropped: {child_sid}")
+                    return
                 upd = _tool_acp_update(data.get("tid") or f"{zid}:{data.get('name', 'tool')}",
                                         data, sub_tool_names)
+                upd["_meta"] = zmeta(data.get("name"))
                 self._send({"jsonrpc": "2.0", "method": "session/update",
-                            "params": {"sessionId": child_sid, "update": upd}})
+                            "params": {"sessionId": sid_acp, "update": upd}})
 
         sub_tool_names = {}
+        # 「父调用 id 缺失」告警去重（本回调看不到子会话登记表，见上）。
+        no_parent_logged = set()
 
         self.zcode.turn_active = True
 

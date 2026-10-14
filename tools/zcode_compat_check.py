@@ -99,6 +99,10 @@ try:
     work = tempfile.mkdtemp(prefix="zcode-compat-")
     zc = z.ZCode(work)
     try:
+        try:
+            zc._push_account_config()
+        except Exception as e:
+            print(f"         (account push failed: {e})")
         key = "compat-" + os.urandom(4).hex()
         zc.workspace = {"workspacePath": work, "workspaceKey": key}
         rid = zc.next_id

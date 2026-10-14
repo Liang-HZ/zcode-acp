@@ -21,7 +21,7 @@ ACP 客户端  ──stdio/JSON-RPC──▶  zcode-acp  ──stdio/JSON-RPC─
 
 - **额度走你自己的 ZCode 订阅。** 适配器只驱动本机已安装、已登录的 ZCode 引擎，用你在 ZCode 客户端里配置的渠道；不代理任何 API、不持有、不搬运任何 key。
 - **原生能力不缩水。** 逐 token 思考（`agent_thought_chunk`）、逐 token 正文（`agent_message_chunk`）、工具卡三段式、行内审批、steering 的 guide 注入、子代理的逐 token 流，全部原样透传。
-- **没有中间态。** 适配器不落库、不联网，唯一可选的磁盘交互是审批桥（见下）。
+- **没有中间态。** 适配器只驱动本机引擎，不落库；除账号权益的现场校验（`subscription/list` / `billing/balance`，与桌面同款、只读）外不发任何请求。唯一可选的磁盘交互是审批桥（见下）。
 
 ### 能力矩阵
 
@@ -30,7 +30,7 @@ ACP 客户端  ──stdio/JSON-RPC──▶  zcode-acp  ──stdio/JSON-RPC─
 | ACP 能力 | 方法 / 事件 | 实测依据 | 已知边界 |
 |---|---|---|---|
 | 初始化 | `initialize` | `test_handshake.py::test_initialize_shape`：`protocolVersion=1`、`sessionCapabilities{list,resume,fork,close}`、`promptCapabilities.embeddedContext=false` | `loadSession=false` —— 引擎不支持 `session/load`，历史只能经 `session/list` + `session/resume` 回来 |
-| 新建会话 | `session/new` | `test_handshake.py::test_session_new_shape`：应答顶层带 `configOptions`（mode / model / reasoning_effort），`models.availableModels` 与 ZCode 桌面端同源 | 模型目录来自本机 `~/.zcode/v2/config.json`；一个适配器进程同一时刻只服务一个活动会话（`session/new` 新建引擎并接管，要并行就起多个进程） |
+| 新建会话 | `session/new` | `test_handshake.py::test_session_new_shape`：应答顶层带 `configOptions`（mode / model / reasoning_effort），`models.availableModels` 与 ZCode 桌面端同源 | 模型目录以**引擎注册表**为真值（订阅渠道按现场权益校验进入；`~/.zcode/v2/config.json` 目录仅作兜底）；一个适配器进程同一时刻只服务一个活动会话（`session/new` 新建引擎并接管，要并行就起多个进程） |
 | 会话族 | `session/list` / `resume` / `fork` / `close` | `test_session_family.py::test_list_resume_fork_close`：写文件 → list 命中 → close → resume 之后历史接上暗号 → fork 出新 id | fork 需要工作区检查点；resume 必须用会话记录自带的 `(workspacePath, workspaceKey)` 二元组 |
 | 流式正文 | `agent_message_chunk` | `test_steering.py::test_steering_injects_into_running_turn`：按拼接后的全文命中暗号（逐 token 流出，逐块匹配等不到） | — |
 | 逐 token 思考 | `agent_thought_chunk` | 引擎 `model.streaming.reasoning_delta` 逐条转发 | 模型不产出思考时自然为空 |
@@ -41,7 +41,8 @@ ACP 客户端  ──stdio/JSON-RPC──▶  zcode-acp  ──stdio/JSON-RPC─
 | 并发 prompt | `session/prompt`（轮次进行中） | `test_steering.py::test_concurrent_prompt_goes_through_guide`：两条 prompt 收口在同一轮（settle 时间差 < 5s），回执带 `_meta.steering` 投递档位 | 注入不成立时回落顺序执行 |
 | 子代理 | 子会话的 `session/update` 流 | 经 V4 通道拿子会话的逐 token 思考/正文/工具入参回参 | 只能观测与取消（`session/cancelBackgroundTask`），不能向运行中的子代理注入消息 |
 | 安全模式 | `modes` + `session/set_mode` | `test_handshake.py::test_session_new_shape`：`default / acceptEdits / plan / bypassPermissions` ↔ 引擎 `build / edit / plan / yolo` | — |
-| 模型与推理强度 | `configOptions` + `session/set_config_option` | 同上用例：`supportsReasoningEffort` 对每个模型恒为真（引擎接受任意档位） | — |
+| 模型与推理强度 | `configOptions` + `session/set_config_option` | `supportsReasoningEffort` 恒为真；模型列表 = 引擎注册表，订阅计划（BigModel Individual / Z.AI）按现场权益校验 + `provider/updateAccountConfig` 快照进入，`account:*` 模型的 setModel 由适配器自动附加推理档位（`test_model_layer.py` 钉住解析规则） | 订阅渠道需要本机已登录的 ZCode 账号；适配器不代理 key——account 模型的运行时鉴权经 `interaction/requestProviderRuntimeHeaders` 现场下发给引擎 |
+| 认证（Terminal Auth） | `initialize.authMethods` + `authenticate` + `zcode-acp --login` | ACP Registry 的 `client.py` auth check 实测通过（`terminal` 型）；`--login` 做安装检测 → 打开 ZCode 桌面端 → 等待登录 | 登录发生在 ZCode 桌面客户端里（适配器不搬运任何凭据） |
 | 上下文用量 | `usage_update` + `PromptResponse.usage` | 圆环 `used/size`：占用口径（`session/read` 的 `runtime.contextUsage.used`，与 ZCode 桌面端圆环同源）+ 模型目录 `contextWindow`。逐轮明细：`session/usage` 累计差 → `usage{input,output,thought,cachedRead,cachedWrite}`（ACP 草案 RFD，camelCase），`test_turn_usage.py` 锁住 | 客户端需支持 `usage_update`；逐轮明细是草案字段，不认识它的客户端会忽略；引擎给不出成本 → `cost` 省略（不发 `amount:0`） |
 | 原生斜杠命令 | `availableCommands` | 实测引擎上报 4 条：`goal` / `compact` / `init` / `plan` | 走引擎原生方法，不进模型；命令由引擎侧决定 |
 | 结构化提问 | `elicitation/create` | 引擎 `interaction/requestUserInput` → ACP 表单 | 客户端需实现 `elicitation/create`；未实现或未应答 → 引擎侧收到 decline |
@@ -81,7 +82,7 @@ optional/nullable），绝不用 `{amount: 0}` 冒充“免费”。
 
 ```bash
 pipx install git+https://github.com/Liang-HZ/zcode-acp
-zcode-acp --version        # zcode-acp 0.7.0
+zcode-acp --version        # zcode-acp 0.9.0
 ```
 
 不想装也可以直接用仓库里的启动器（它把仓库根加进 `sys.path`，不需要安装）：
@@ -345,7 +346,7 @@ Three design boundaries:
 - **Native capabilities pass through unwrapped.** Token-by-token thinking
   (`agent_thought_chunk`), token-by-token text (`agent_message_chunk`), three-stage tool cards,
   inline approvals, steering's guide injection and token-level subagent streams.
-- **No middle state.** The adapter keeps no database and makes no network calls; the only
+- **No middle state.** The adapter keeps no database; apart from the read-only live entitlement checks (`subscription/list` / `billing/balance`, mirroring the desktop host) it makes no network calls. The only
   optional disk interaction is the approval bridge (below).
 
 ### Capability matrix
@@ -356,7 +357,7 @@ engine and a real model).
 | ACP capability | Method / event | Evidence | Known boundary |
 |---|---|---|---|
 | Initialize | `initialize` | `test_handshake.py::test_initialize_shape`: `protocolVersion=1`, `sessionCapabilities{list,resume,fork,close}`, `promptCapabilities.embeddedContext=false` | `loadSession=false` — the engine has no `session/load`; history comes back via `session/list` + `session/resume` |
-| New session | `session/new` | `test_handshake.py::test_session_new_shape`: top-level `configOptions` (mode / model / reasoning_effort), `models.availableModels` sourced from the ZCode desktop config | Model catalog comes from the local `~/.zcode/v2/config.json`; one adapter process serves one active session at a time (`session/new` spawns a fresh engine and takes over — run several processes for parallel sessions) |
+| New session | `session/new` | `test_handshake.py::test_session_new_shape`: top-level `configOptions` (mode / model / reasoning_effort), `models.availableModels` sourced from the engine registry | The model catalog is engine-authoritative (subscription plans enter via live entitlement checks; the local `~/.zcode/v2/config.json` is only a fallback); one adapter process serves one active session at a time (`session/new` spawns a fresh engine and takes over — run several processes for parallel sessions) |
 | Session family | `session/list` / `resume` / `fork` / `close` | `test_session_family.py::test_list_resume_fork_close`: write a file → list finds it → close → resume replays the codeword from history → fork returns a new id | fork needs a workspace checkpoint; resume must use the session's own `(workspacePath, workspaceKey)` pair |
 | Streaming text | `agent_message_chunk` | `test_steering.py::test_steering_injects_into_running_turn` matches a codeword against the concatenated text (per-token chunks never match piecewise) | — |
 | Per-token thinking | `agent_thought_chunk` | Engine `model.streaming.reasoning_delta` forwarded line by line | Empty when the model produces no reasoning |
@@ -367,7 +368,8 @@ engine and a real model).
 | Concurrent prompt | `session/prompt` while a turn runs | `test_steering.py::test_concurrent_prompt_goes_through_guide`: both prompts settle in the same turn (< 5s apart) and the reply carries `_meta.steering` | Falls back to sequential execution when injection is refused |
 | Subagents | child-session `session/update` stream | Token-level child thinking/text and full tool input/output over the V4 channel | Observable and cancellable (`session/cancelBackgroundTask`), but no way to inject a message into a running subagent |
 | Safety modes | `modes` + `session/set_mode` | `test_handshake.py::test_session_new_shape`: `default / acceptEdits / plan / bypassPermissions` ↔ engine `build / edit / plan / yolo` | — |
-| Model & reasoning effort | `configOptions` + `session/set_config_option` | Same test: `supportsReasoningEffort` is always true (the engine accepts any level) | — |
+| Model & reasoning effort | `configOptions` + `session/set_config_option` | `supportsReasoningEffort` is always true; the model list is the engine registry — subscription plans (BigModel Individual / Z.AI) enter via live entitlement checks + a `provider/updateAccountConfig` snapshot, and `account:*` models get their reasoning level attached automatically (`test_model_layer.py` pins the resolution rules) | Subscription channels require a signed-in ZCode account on this machine; no API keys are proxied — runtime auth for `account:*` models is handed to the engine on demand via `interaction/requestProviderRuntimeHeaders` |
+| Auth (Terminal Auth) | `initialize.authMethods` + `authenticate` + `zcode-acp --login` | Passes the ACP Registry's `client.py` auth check (type `terminal`); `--login` checks the install, opens the ZCode desktop app and waits for sign-in | Sign-in happens in the ZCode desktop app (the adapter moves no credentials) |
 | Context usage | `usage_update` + `PromptResponse.usage` | Ring `used/size`: engine occupancy (`session/read` → `runtime.contextUsage.used`, the same source the ZCode desktop ring uses) + the model catalog's `contextWindow`. Per-turn detail: `session/usage` cumulative deltas → `usage{input,output,thought,cachedRead,cachedWrite}` (draft RFD, camelCase), pinned by `test_turn_usage.py` | The client must support `usage_update`; the per-turn detail is a draft field clients may ignore; no real cost from the engine → `cost` is omitted (never `amount: 0`) |
 | Native slash commands | `availableCommands` | The engine reports 4: `goal` / `compact` / `init` / `plan` | They run as native engine methods, never hitting the model; the set is engine-defined |
 | Structured questions | `elicitation/create` | Engine `interaction/requestUserInput` → ACP form | The client must implement `elicitation/create`; if it does not (or does not answer), the engine receives a decline |
@@ -413,7 +415,7 @@ to be free.
 
 ```bash
 pipx install git+https://github.com/Liang-HZ/zcode-acp
-zcode-acp --version        # zcode-acp 0.7.0
+zcode-acp --version        # zcode-acp 0.9.0
 ```
 
 Prefer no install? Run the launcher straight from a checkout (it puts the repo root on

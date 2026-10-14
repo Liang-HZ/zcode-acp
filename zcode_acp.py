@@ -31,6 +31,8 @@
             （可选：文件式外部审批桥，headless / 自研客户端用；见 README）
 用法：zcode-acp  （stdio 上的 ACP 服务器）
 """
+import base64
+import hashlib
 import json
 import os
 import re
@@ -40,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 
 ZC_CJS = os.environ.get(
@@ -153,17 +156,32 @@ def trace(msg):
 # 3.15 的投影 contextWindow 只在会话创建/水合时写一次、之后换模型不更新，
 # 会一直停在默认 200000（目录里 glm-5.3-flash=1000000，投影恒为 200000，
 # 客户端上下文圆环因此长期按 200K 算）。
+LAST_CATALOG_CURRENT = None   # zcode_model_catalog 最近一次解析出的当前模型（value 串）
+LAST_CATALOG_ALIAS = {}       # 同上：value → (providerId, modelId, variants)
+MODEL_LEVEL_INFO = {}         # "pid/mid" -> {"values": [...], "default": ...}
+MODEL_AVAIL = {}              # "pid/mid" -> 引擎 availability 条目的档位
 MODEL_AVAIL_LIST = []
 
 
 def capture_availability(result):
-    """session/create|resume 的 result → 记录引擎 availability（有序）。"""
+    """session/create|resume|fork 的 result → 记录引擎 availability（有序）。
+
+    这是"按 ZCode 自身状态同步"的正源：provider id 拼写、权益可见性、
+    模型档位都以引擎注册表为准（文件目录只做兜底）。"""
     try:
         avail = ((((result or {}).get("settings") or {}).get("model") or {})
                  .get("available") or [])
         entries = [e for e in avail if isinstance(e, dict)]
-        if entries:
-            MODEL_AVAIL_LIST[:] = entries
+        if not entries:
+            return
+        MODEL_AVAIL_LIST[:] = entries
+        for entry in entries:
+            ref = _d(entry.get("ref")) or entry
+            pid, mid = ref.get("providerId"), ref.get("modelId")
+            if pid and mid:
+                MODEL_AVAIL[f"{pid}/{mid}"] = (entry.get("reasoning")
+                                               or entry.get("options") or {})
+        log(f"engine availability: {len(entries)} model(s)")
     except Exception as e:
         log(f"availability capture failed: {e}")
 
@@ -194,15 +212,508 @@ def is_model_selection_failure(text):
 
 # ---------------------------------------------------------------- ZCode client
 
-def zcode_model_catalog(current_mode="default"):
+def _d(x):
+    """dict-or-empty：引擎/客户端载荷里非 dict（list/str/None…）一律当空 dict。
+
+    2026-10-13 事故防御：某处载荷形状为 list 时 `.get` 抛
+    "'list' object has no attribute 'get'"，异常从 send() 冒出去把整轮
+    判死，而引擎侧那轮仍在跑 → 会话卡进 "active prompt exists"。
+    防御性解析：形状漂移只降级，不致命。"""
+    return x if isinstance(x, dict) else {}
+
+
+def _b64url(data):
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def zcode_credential(name):
+    """读 ~/.zcode/v2/credentials.json 的解密值（enc:v1 = AES-256-GCM）。
+
+    密钥 = sha256(ZCODE_CREDENTIAL_SECRET 或确定性回退串)。本机未设环境变量，
+    回退串即真实密钥（与桌面/CLI 同源）→ 桥可以读 zcodejwttoken 等凭据。
+    缺失/解密失败返回 None（调用方按"无鉴权"降级）。"""
+    try:
+        path = os.path.expanduser("~/.zcode/v2/credentials.json")
+        with open(path) as f:
+            raw = json.load(f)
+        value = raw.get(name)
+        if not value:
+            return None
+        if not value.startswith("enc:v1:"):
+            return value
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        iv, tag, data = [_b64url(x) for x in value[6:].split(".")]
+        secret = os.environ.get("ZCODE_CREDENTIAL_SECRET") or (
+            f"zcode-credential-fallback:{sys.platform}:{os.path.expanduser('~')}:"
+            f"{os.environ.get('USER') or 'unknown'}")
+        key = hashlib.sha256(secret.encode()).digest()
+        return AESGCM(key).decrypt(iv, data + tag, None).decode()
+    except Exception as e:
+        log(f"credential {name} 读取失败: {e}")
+        return None
+
+
+def _builtin_zhipu_rules():
+    """builtin 表里的 zhipu-account 规则（订阅渠道定义）。返回 (路径, 规则, 表)。"""
+    path = resolve_builtin_table_path()
+    if not path:
+        return None, [], None
+    try:
+        with open(path) as f:
+            table = json.load(f)
+    except Exception as e:
+        log(f"builtin 表读取失败: {e}")
+        return path, [], None
+    rules = (((table.get("config") or {}).get("providerConfigRules") or {})
+             .get("providerRules") or [])
+    zhipu = [r for r in rules if isinstance(r, dict)
+             and (((r.get("config") or {}).get("access") or {}).get("type")
+                  == "zhipu-account")]
+    return path, zhipu, table
+
+
+def config_provider_id_for(account_pid, rules):
+    """account:* → config.json 里的 legacy builtin:* 拼写（权益源都用后者）。"""
+    rule = next((r for r in rules if r.get("providerId") == account_pid), None)
+    access = ((rule.get("config") or {}).get("access") or {}) if rule else {}
+    family, mode = access.get("accountType"), access.get("mode")
+    if family and mode:
+        plan = "coding-plan" if mode == "individual-coding-plan" else mode
+        return f"builtin:{family}-{plan}"
+    m = re.match(r"^account:([a-z0-9]+)-(start-plan|(?:individual-|team-)?coding-plan)$",
+                 account_pid or "")
+    if m:
+        return f"builtin:{m.group(1)}-" + (
+            "start-plan" if m.group(2) == "start-plan" else "coding-plan")
+    return account_pid
+
+
+_LIVE_ENTITLED_LAST = None   # 最近一次现场校验成功的权益集合（进程内，离线兜底用）
+
+
+_CRED_WATCH = [
+    "~/.zcode/v2/credentials.json",       # 登录/账号切换
+    "~/.zcode/v2/config.json",
+    "~/.zcode/v2/setting.json",           # 家族选择
+    "~/.zcode/v2/coding-plan-cache.json",
+]
+
+
+def _cred_fingerprint():
+    """账号相关文件的指纹（mtime，毫秒）。账号可能随时切换，用它触发重算。"""
+    fp = []
+    for p in _CRED_WATCH:
+        try:
+            fp.append(int(os.path.getmtime(os.path.expanduser(p)) * 1000))
+        except OSError:
+            fp.append(0)
+    return tuple(fp)
+
+
+def zcode_app_version():
+    """ZCode.app 的 CFBundleShortVersionString（业务请求的 app_version 要带）。"""
+    try:
+        import plistlib
+        app = os.path.dirname(os.path.dirname(os.path.dirname(ZC_CJS)))
+        with open(os.path.join(app, "Info.plist"), "rb") as f:
+            v = (plistlib.load(f) or {}).get("CFBundleShortVersionString")
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def _desktop_http_headers():
+    """桌面宿主业务请求的公共头（out/host 的 buildZCodeSourceHeadersFromContext）。
+
+    ⚠️ X-Device-Mid 必带：缺它时 /api/v1/zcode-plan/* 一律回 400
+    "parameter error"（2026-10-14 实测；值 = ~/.zcode/v2/telemetry-state.json
+    的 deviceMid，桌面自己也是从这里取的）。"""
+    mid = ""
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/telemetry-state.json")) as f:
+            mid = str((json.load(f) or {}).get("deviceMid") or "")
+    except Exception:
+        pass
+    machine = ""
+    try:
+        machine = os.uname().machine.lower()
+    except Exception:
+        pass
+    ver = zcode_app_version()
+    headers = {
+        "User-Agent": f"ZCode/{ver}",
+        "HTTP-Referer": "https://zcode.z.ai",
+        "X-Title": "Z Code@electron",
+        "X-ZCode-App-Version": ver,
+        "X-Client-Language": "zh-CN",
+        "X-Os-Category": "macos",
+    }
+    if machine:
+        headers["X-Platform"] = f"darwin-{machine}"
+    if mid:
+        headers["X-Device-Mid"] = mid
+    return headers
+
+
+def live_start_plan_active(family):
+    """现场校验某家族的 Start Plan 是否在期（桌面 billing/balance 同款）。
+
+    桌面 out/host 的 validateStartPlanAvailability：
+      GET {zcode.z.ai}/api/v1/zcode-plan/billing/balance?app_version=…，
+      Bearer = zcodejwttoken（本机 active_provider=bigmodel）或渠道自身 apiKey
+      （legacy config.json 的 builtin:{family}-start-plan.options.apiKey）；
+      data.plans 里存在 status=active 且 plan_id/name 含 "start-plan" 的记录
+      → 在期（桌面 hasActiveStartPlan 判据一致）。
+    返回 True/False；无 token / 网络失败返回 None（不表态，调用方按未确认
+    处理——桌面 unknown 同样不展示）。"""
+    token = zcode_credential("zcodejwttoken")
+    if not token:
+        try:
+            with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
+                v2 = json.load(f)
+            token = (((v2.get("provider") or {}).get(
+                f"builtin:{family}-start-plan") or {}).get("options")
+                or {}).get("apiKey") or ""
+        except Exception:
+            token = ""
+    if not token:
+        return None
+    url = (os.environ.get("ZCODE_PLAN_BALANCE_URL")
+           or "https://zcode.z.ai/api/v1/zcode-plan/billing/balance")
+    url += ("&" if "?" in url else "?") + "app_version=" + zcode_app_version()
+    try:
+        headers = _desktop_http_headers()
+        headers["Authorization"] = f"Bearer {token}"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                    timeout=5) as resp:
+            env = json.load(resp)
+    except Exception as e:
+        log(f"start plan live check ({family}) failed: {e}")
+        return None
+    if not isinstance(env, dict):
+        return None
+    if env.get("success") is False or (
+            isinstance(env.get("code"), int) and env["code"] not in (0, 200)):
+        return False
+    for p in ((env.get("data") or {}).get("plans") or []):
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("status") or "").strip().lower() != "active":
+            continue
+        pid = str(p.get("plan_id") or "").strip().lower()
+        name = str(p.get("name") or "").strip().lower()
+        if not pid and not name:
+            return True
+        if "start-plan" in pid or "start plan" in pid \
+                or "start-plan" in name or "start plan" in name:
+            return True
+    return False
+
+
+_LIVE_ENTITLED_LAST = None   # 最近一次现场校验成功的权益集合（进程内，离线兜底用）
+
+def live_entitled_plans():
+    """现场校验订阅权益（与桌面 host 的 resolveFamilyAvailability 同判据）。
+
+    对每个"已连接"的家族（credentials.json 里有该家族的 oauth 凭据）：
+      1) 个人 Coding Plan：GET {family_host}/api/biz/subscription/list，
+         productId/Name 含 "coding" 且 status=VALID、inCurrentPeriod=true
+         → builtin:{family}-coding-plan（= 桌面 isActivePersonalCodingPlan）。
+      2) Start Plan：见 live_start_plan_active → builtin:{family}-start-plan。
+    家族未连接 → 不产出任何权益（桌面把整族标 coding_plan_not_connected）。
+    返回 legacy 权益键集合；现场全挂（无凭据/断网）时返回**进程内最近一次
+    成功值**，首次即全挂返回 None（调用方回落本地信号）。"""
+    global _LIVE_ENTITLED_LAST
+    targets = []
+    for family, token_name, env_name, default_host in (
+        ("bigmodel", "oauth:bigmodel:access_token", "BIGMODEL_API_BASE_URL", "https://bigmodel.cn"),
+        ("zai", "oauth:zai:access_token", "ZAI_BUSINESS_BASE_URL", "https://api.z.ai"),
+    ):
+        token = zcode_credential(token_name)   # 每次现读（账号可能已切换）
+        if token:
+            targets.append((family, token,
+                            (os.environ.get(env_name) or default_host).rstrip("/")))
+    if not targets:
+        # 无任何登录凭据：没有账号身份 → 不产出任何权益（桌面整族
+        # coding_plan_not_connected）。返回空集合而非 None——避免调用方
+        # 回落到可能过期的本地缓存把已退场的渠道顶回目录。
+        return set()
+    results, start_active = {}, {}
+
+    def check(family, token, host):
+        try:
+            req = urllib.request.Request(
+                host + "/api/biz/subscription/list",
+                headers={"Authorization": token, "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                results[family] = json.load(resp)
+        except Exception as e:
+            log(f"entitlement live check ({family}) failed: {e}")
+        try:
+            start_active[family] = live_start_plan_active(family)
+        except Exception as e:
+            log(f"start plan live check ({family}) failed: {e}")
+
+    threads = [threading.Thread(target=check, args=t, daemon=True) for t in targets]
+    for th in threads:
+        th.start()
+    deadline = time.time() + 6
+    for th in threads:
+        th.join(max(0.1, deadline - time.time()))
+
+    out, got_any = set(), False
+    for family, _token, _host in targets:
+        payload = results.get(family)
+        if isinstance(payload, dict):
+            if not (payload.get("success") is False or (
+                    isinstance(payload.get("code"), int)
+                    and payload["code"] not in (0, 200))):
+                got_any = True
+                for item in payload.get("data") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    label = f"{item.get('productId') or ''} " \
+                            f"{item.get('productName') or ''}".lower()
+                    if "coding" not in label:
+                        continue
+                    if item.get("status") == "VALID" \
+                            and item.get("inCurrentPeriod") is True:
+                        out.add(f"builtin:{family}-coding-plan")
+        st = start_active.get(family)
+        if st is not None:
+            got_any = True
+            if st:
+                out.add(f"builtin:{family}-start-plan")
+    if not got_any:
+        log("entitlement live check: 全部失败，沿用最近一次成功值"
+            if _LIVE_ENTITLED_LAST is not None else
+            "entitlement live check: 全部失败（无历史值）")
+        return _LIVE_ENTITLED_LAST
+    _LIVE_ENTITLED_LAST = set(out)
+    log(f"entitlement live check: {sorted(out) or '(none)'}")
+    return out
+
+
+def entitled_builtin_providers(live=None):
+    """用户实际持有的订阅（权益键 = legacy builtin:<family>-<plan>）。
+
+    与桌面 host 的 resolveFamilyAccountProviders/mQ 对齐：
+      1) **现场校验为准**（live，见 live_entitled_plans）：某家族一旦有现场
+         结论，未确认的 plan 一律不展示（桌面 unavailable/unknown ⇒
+         entitled=false）。2026-10-14 报障：coding-plan-cache.json 里 9 天前
+         就退场的 zai-start-plan 被无条件并进来，一直顶在 Codeg 目录里。
+      2) 桌面里显式启用且填了 key 的 apiKey 渠道（config.json builtin:*
+         enabled+apiKey）是直连渠道，与订阅校验无关，始终保留。
+      3) 只有**现场校验整体不可用**（离线）时才退回本地信号
+         （coding-plan-cache / setting.json 选择记录）。
+    `live` 为调用方预取的现场结果（集合或 None）——同一次 session/new 内只查
+    一次网络；不传则现查。"""
+    if live is None:
+        live = live_entitled_plans()
+    out = set(live or ())
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
+            v2 = json.load(f)
+        for pid, pc in (v2.get("provider") or {}).items():
+            if pid.startswith("builtin:") and (pc or {}).get("enabled") is True \
+                    and ((pc.get("options") or {}).get("apiKey")):
+                out.add(pid)
+    except Exception:
+        pass
+    if live is not None:
+        return out
+    # —— 以下仅在现场校验整体不可用时执行（离线兜底）——
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/coding-plan-cache.json")) as f:
+            cache = json.load(f)
+        for pid, entry in ((cache.get("entryStatus") or {}).get("items") or {}).items():
+            if (entry or {}).get("status") == "available":
+                out.add(pid)
+    except Exception:
+        pass
+    if not out:
+        try:
+            with open(os.path.expanduser("~/.zcode/v2/setting.json")) as f:
+                setting = json.load(f)
+            for selected in (setting.get("modelProviderFamilySelectedKeys") or {}).values():
+                m = re.search(r"(builtin:[a-z0-9-]+)", str(selected))
+                if m:
+                    out.add(m.group(1))
+        except Exception:
+            pass
+    return out
+
+
+_CRED_WATCH = [
+    "~/.zcode/v2/credentials.json",       # 登录/账号切换
+    "~/.zcode/v2/config.json",
+    "~/.zcode/v2/setting.json",           # 家族选择
+    "~/.zcode/v2/coding-plan-cache.json",
+]
+
+
+def build_account_provider_payload(live_entitled=None):
+    """provider/updateAccountConfig 载荷（桌面宿主同款形状，schema 实测）。"""
+    path, zhipu, table = _builtin_zhipu_rules()
+    if not path or not zhipu or table is None:
+        return None
+    revision = f"zcode-builtin:{table.get('revision') or 0}:" + hashlib.sha256(
+        os.path.abspath(path).encode()).hexdigest()
+    entitled = entitled_builtin_providers(live_entitled)
+    providers, states = {}, {}
+    for rule in zhipu:
+        pid = rule.get("providerId") or ""
+        if not pid:
+            continue
+        cfg = rule.get("config") or {}
+        is_entitled = config_provider_id_for(pid, zhipu) in entitled
+        entry = {"access": {"type": "zhipu-account", "entitled": is_entitled}}
+        if cfg.get("builtinModelIds"):
+            entry["builtinModelIds"] = cfg["builtinModelIds"]
+        providers[pid] = entry
+        states[pid] = {"availability": "available" if is_entitled else "unavailable",
+                       "entitled": is_entitled, "current": is_entitled}
+    return {"revision": f"account:zcode-acp:{int(time.time() * 1000)}",
+            "basedOnZCodeBuiltinRevision": revision,
+            "providers": providers, "states": states}
+
+
+def coding_plan_request_auth(provider_id):
+    """account:* 模型请求的运行时鉴权（interaction/requestProviderRuntimeHeaders）。
+
+    来源优先级（与桌面 requestAuth 行为对齐）：
+    1) 凭据存储里"当前登录账号"的账户 key —— 形如
+       `account-provider:coding-plan:<accountProviderId>:account:<uid>:api-key`
+       （桌面开通订阅时写入；本机 config.json 的旧 key 属于另一个账号，
+        用它打订阅端点会 1113"余额不足或无可用资源包"）；
+    2) legacy config.json 的 plan key（无凭据存储时兜底）；
+    3) ZCode 业务 JWT（zcodejwttoken，加密存储可解密）——start-plan 实测可用。"""
+    if not provider_id or not provider_id.startswith("account:"):
+        return None
+    _, rules, _ = _builtin_zhipu_rules()
+    legacy = config_provider_id_for(provider_id, rules)
+    family = ("bigmodel" if provider_id.startswith("account:bigmodel")
+              else "zai" if provider_id.startswith("account:zai") else "")
+    # 1) 凭据存储：当前账号的账户 key
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/credentials.json")) as f:
+            creds = json.load(f)
+        prefix = f"account-provider:coding-plan:{provider_id}:account:"
+        candidates = [k for k in creds
+                      if k.startswith(prefix) and k.endswith(":api-key")]
+        uid = ""
+        if family:
+            info = zcode_credential(f"oauth:{family}:user_info")
+            if info:
+                try:
+                    uid = str((json.loads(info) or {}).get("id") or "")
+                except Exception:
+                    uid = ""
+        if uid:
+            hit = f"{prefix}{uid}:api-key"
+            if hit in candidates:
+                key = zcode_credential(hit)
+                if key:
+                    return {"apiKey": key}
+        for name in candidates:
+            key = zcode_credential(name)
+            if key:
+                return {"apiKey": key}
+    except Exception:
+        pass
+    # 2) legacy config.json 的 plan key
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
+            v2 = json.load(f)
+        key = (((v2.get("provider") or {}).get(legacy) or {}).get("options")
+               or {}).get("apiKey")
+        if key:
+            return {"apiKey": key}
+    except Exception:
+        pass
+    # 3) 业务 JWT
+    jwt = zcode_credential("zcodejwttoken")
+    if jwt:
+        return {"apiKey": jwt}
+    return None
+
+
+def _levels_from_v2(model_id):
+    """v2 配置里某模型的推理档位：(values, default)。"""
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
+            v2 = json.load(f)
+        for pc in (v2.get("provider") or {}).values():
+            mc = (pc.get("models") or {}).get(model_id)
+            if mc:
+                rs = mc.get("reasoning") or {}
+                vs = rs.get("variants")
+                if vs:
+                    return ([str(v) for v in (vs if isinstance(vs, list) else [vs])],
+                            rs.get("defaultVariant"))
+                return [], None
+    except Exception:
+        pass
+    return [], None
+
+
+def _level_choice(values, default):
+    if default in values:
+        return default
+    for pref in ("max", "high", "enabled", "medium"):
+        if pref in values:
+            return pref
+    return values[-1] if values else None
+
+
+def resolve_reasoning_level(provider_id, model_id, requested=None):
+    """setModel 要带的推理档位：模型有档位 → 默认/最高合法值；account 模型引擎
+    强制要求档位（无 specs）→ 实测接受 "max"；无任何信息 → None（不带 options）。"""
+    key = f"{provider_id}/{model_id}"
+    info = MODEL_LEVEL_INFO.get(key) or {}
+    values = list(info.get("values") or [])
+    default = info.get("default")
+    if not values:
+        values, default = _levels_from_v2(model_id)
+    if requested and (not values or requested in values):
+        return requested
+    if values:
+        return _level_choice(values, default)
+    av = MODEL_AVAIL.get(key) or {}
+    av_levels = [(l.get("value") if isinstance(l, dict) else str(l))
+                 for l in (av.get("levels") or [])]
+    av_levels = [v for v in av_levels if v]
+    if av.get("defaultLevel"):
+        return av["defaultLevel"]
+    if av_levels:
+        return _level_choice(av_levels, None)
+    if str(provider_id or "").startswith("account:"):
+        return "max"
+    return None
+
+
+def model_selection(provider_id, model_id, level=None):
+    sel = {"providerId": provider_id, "modelId": model_id}
+    lv = resolve_reasoning_level(provider_id, model_id, level)
+    if lv:
+        sel["options"] = {"reasoningLevel": lv}
+    return sel
+
+
+def zcode_model_catalog(current_mode="default", current_thought=None,
+                        engine_entries=None, live_entitled=None):
     """模型目录：唯一事实源 = 桌面版配置 ~/.zcode/v2/config.json。
     过滤语义与 ZCode 桌面菜单一致：enabled=False、系统禁用（not_entitled/inactive）、
     未填 apiKey 的渠道不显示。用户在 ZCode 客户端的任何增删改/启停，
-    下一次 session/new 自动同步——无需在客户端侧做任何事。"""
+    下一次 session/new 自动同步——无需在 Codeg 侧做任何事。"""
+    global LAST_CATALOG_CURRENT, LAST_CATALOG_ALIAS
     if current_mode not in MODE_TO_ENGINE:
         current_mode = "default"
     available, alias = [], {}
     current = None
+    levels_by_model = {}   # "pid/mid" -> {"values": [...], "default": ...}
 
     def add(pid, pname, mid, label, ctx=None, variants=None):
         value = f"{pname}/{mid}"
@@ -212,6 +723,7 @@ def zcode_model_catalog(current_mode="default"):
         available.append({
             "modelId": value,
             "label": label or mid,
+            "providerLabel": pname,
             "totalContextTokens": ctx or None,
             **({"supportsReasoningEffort": True} if variants else {}),
         })
@@ -220,8 +732,8 @@ def zcode_model_catalog(current_mode="default"):
         v2 = json.load(open(os.path.expanduser("~/.zcode/v2/config.json")))
         # personal 渠道的用户停用状态在 provider_config.json（enabled=false
         # 就是桌面设置页里的"停用"）。legacy config.json 对同一渠道可能
-        # enabled=None——不能因此把它当"可用"顶回目录（2026-10-14 实障：
-        # 没启用的"公司模型网关"一直显示在客户端）。
+        # enabled=None——不能因此把它当"可用"顶回目录（2026-10-14 报障：
+        # 没启用的"公司模型网关"一直显示在 Codeg）。
         personal_disabled = set()
         try:
             with open(os.path.expanduser("~/.zcode/v2/provider_config.json")) as f:
@@ -251,7 +763,13 @@ def zcode_model_catalog(current_mode="default"):
             pname = pc.get("name") or pid
             models = pc.get("models") or {}
             for mid, mc in models.items():
-                variants = ((mc.get("reasoning") or {}).get("variants")) or None
+                rs = mc.get("reasoning") or {}
+                variants = rs.get("variants") or None
+                if variants:
+                    vs = variants if isinstance(variants, list) else [variants]
+                    levels_by_model[f"{pid}/{mid}"] = {
+                        "values": [str(v) for v in vs],
+                        "default": rs.get("defaultVariant")}
                 # 与桌面一致：自定义渠道显示模型 ID 原文（name 字段已过期不用）
                 add(pid, pname, mid, mid,
                     (mc.get("limit") or {}).get("context"), variants)
@@ -264,23 +782,146 @@ def zcode_model_catalog(current_mode="default"):
     except Exception as e:
         log(f"v2 catalog read failed: {e}")
 
+    # 个人渠道补集：3.12+ 桌面把用户新增的模型写进 provider_config.json
+    # （legacy config.json 可能停更）→ 两处并集才不漏模型。
+    # enabled=false 的渠道**不展示**：这个标志就是桌面设置页的开关（桌面把
+    # 这份文件原样注入引擎，引擎按它过滤；2026-10-14 实测），Codeg 目录跟它
+    # 保持一致——用户没启用的渠道（如"公司模型网关"）不应出现在这里。
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/provider_config.json")) as f:
+            pcfg = json.load(f)
+        pc_rules = (((pcfg.get("config") or {}).get("providerConfigRules") or {})
+                    .get("providerRules") or [])
+        model_rules = (((pcfg.get("config") or {}).get("modelConfigRules") or {})
+                       .get("providerModelRules") or [])
+        model_rule_index = {
+            (r.get("providerId"), r.get("modelId")): (r.get("config") or {})
+            for r in model_rules if isinstance(r, dict)}
+        for rule in pc_rules:
+            pid = rule.get("providerId") or ""
+            if not pid or pid.startswith("builtin:"):
+                continue
+            if rule.get("enabled") is False:
+                continue
+            cfg2 = rule.get("config") or {}
+            pname = rule.get("providerName") or pid
+            for mid in (cfg2.get("personalModelIds") or []):
+                if not isinstance(mid, str):
+                    continue
+                props = (model_rule_index.get((pid, mid)) or {}).get("properties") or {}
+                add(pid, pname, mid, mid, props.get("contextWindow"))
+    except Exception as e:
+        log(f"personal catalog 补集失败: {e}")
+
+    # 订阅（account:*）渠道：桌面按权益运行时推送；权益内才进列表
+    # （"有订阅才显示、没订阅不显示"——与桌面菜单语义一致）。
+    account_entries = []
+    try:
+        _, zhipu_rules, _ = _builtin_zhipu_rules()
+        entitled = entitled_builtin_providers(live_entitled)
+        for rule in zhipu_rules:
+            pid = rule.get("providerId") or ""
+            if config_provider_id_for(pid, zhipu_rules) not in entitled:
+                continue
+            cfg3 = rule.get("config") or {}
+            fam = ((cfg3.get("access") or {}).get("accountType") or "")
+            brand = {"zai": "Z.AI", "bigmodel": "BigModel"}.get(fam)
+            pname = (rule.get("providerName") or pid).strip()
+            if brand and not pname.lower().startswith(brand.lower()):
+                pname = f"{brand} {pname}"
+            for mid in (cfg3.get("builtinModelIds") or []):
+                if not isinstance(mid, str):
+                    continue
+                value = f"{pname}/{mid}"
+                if value in alias:
+                    continue
+                alias[value] = (pid, mid, None)
+                account_entries.append({
+                    "modelId": value, "label": mid,
+                    "providerLabel": pname,
+                    "totalContextTokens": None,
+                    "supportsReasoningEffort": True,
+                })
+        if account_entries:
+            available = account_entries + available
+    except Exception as e:
+        log(f"account catalog 构建失败: {e}")
+
     env_model = os.environ.get("ZCODE_ACP_MODEL")
     if env_model:
         current = env_model
         if env_model not in alias:
             alias[env_model] = (*env_model.split("/", 1), None)
-            available.append({"modelId": env_model, "label": env_model.split("/")[-1]})
+            available.append({"modelId": env_model, "label": env_model.split("/")[-1],
+                              "providerLabel": env_model.split("/")[0]
+                              if "/" in env_model else ""})
     if current is None and available:
         current = available[0]["modelId"]
     if current and current not in alias:
         alias[current] = (*current.split("/", 1), None)
-        available.insert(0, {"modelId": current, "label": current.split("/")[-1]})
+        available.insert(0, {"modelId": current, "label": current.split("/")[-1],
+                             "providerLabel": current.split("/")[0]
+                             if "/" in current else ""})
 
+    if engine_entries:
+        # 引擎 availability 为准（桌面 App 菜单同源）：provider id 拼写、权益
+        # 可见性、档位都以引擎注册表为准；文件目录只在上面的兜底分支用。
+        prev_ref = alias.get(current) if current else None
+        new_avail, new_alias, new_levels = [], {}, {}
+        for entry in engine_entries:
+            if not isinstance(entry, dict):
+                continue
+            ref = _d(entry.get("ref")) or entry
+            e_pid, e_mid = ref.get("providerId"), ref.get("modelId")
+            if not e_pid or not e_mid:
+                continue
+            pname = entry.get("providerLabel") or e_pid
+            if str(e_pid).startswith("account:"):
+                brand = ("Z.AI" if str(e_pid).startswith("account:zai")
+                         else "BigModel" if str(e_pid).startswith("account:bigmodel")
+                         else "")
+                if brand and not pname.lower().startswith(brand.lower()):
+                    pname = f"{brand} {pname}"
+            rs = _d(entry.get("reasoning"))
+            vs = [l.get("value") if isinstance(l, dict) else str(l)
+                  for l in (rs.get("levels") or [])]
+            vs = [v for v in vs if v]
+            if vs:
+                new_levels[f"{e_pid}/{e_mid}"] = {
+                    "values": vs, "default": rs.get("defaultLevel")}
+            value = f"{pname}/{e_mid}"
+            if value in new_alias:
+                continue
+            new_alias[value] = (e_pid, e_mid, vs or None)
+            new_avail.append({
+                "modelId": value,
+                "label": entry.get("label") or e_mid,
+                "providerLabel": pname,
+                "totalContextTokens": entry.get("contextWindow") or None,
+                "supportsReasoningEffort": True,
+            })
+        if new_avail:
+            new_current = None
+            if prev_ref:
+                for value, ent2 in new_alias.items():
+                    if (ent2[0], ent2[1]) == (prev_ref[0], prev_ref[1]):
+                        new_current = value
+                        break
+            if env_model and env_model in new_alias:
+                new_current = env_model
+            if new_current is None:
+                new_current = new_avail[0]["modelId"]
+            available, alias, levels_by_model, current = (
+                new_avail, new_alias, new_levels, new_current)
+
+    LAST_CATALOG_CURRENT = current
+    LAST_CATALOG_ALIAS = alias
+    MODEL_LEVEL_INFO.clear()
+    MODEL_LEVEL_INFO.update(levels_by_model)
     catalog = {"availableModels": available, "currentModelId": current, "alias": alias}
     # 模式也进 configOptions（category:"mode"）——生态惯例：claude / codex / cursor /
     # codebuddy / opencode / qoder 等所有提供 configOptions 的 agent 都把模式维度
-    # 放进配置项。只发 legacy `modes` 的话，严格按规范实现的客户端会隐藏模式选择器
-    # （ACP 规范：
+    # 放进配置项。只发 legacy `modes` 的话，Codeg 会隐藏模式选择器（ACP 规范：
     # "Clients SHOULD use them [configOptions] instead of the modes field"），
     # 用户就再也切不了模式。legacy modes 仍保留（规范要求过渡期双发）。
     cfg_opts = [{
@@ -296,20 +937,27 @@ def zcode_model_catalog(current_mode="default"):
     }]
     # 推理档位：所有模型都提供（ZCode 引擎接受任意档位的 setThoughtLevel，实测确认）。
     # ⚠️ availableModels 里每条都要带 supportsReasoningEffort=True —— 之前只在模型
-    # 自带 reasoning variants 时才给，客户端据此渲染推理档位按钮 → 换到无 variants
-    # 的模型（如 deepseek-flash）按钮就消失了。引擎反正接受任意档位，统一给 True。
+    # 自带 reasoning variants 时才给，Codeg 据此渲染 🧠 按钮 → 换到无 variants 的模型
+    # （如 deepseek-flash）按钮就消失了。引擎反正接受任意档位，统一给 True。
     _ORDER = ["low", "medium", "high", "xhigh", "max"]
     name_map = {"low": "低", "medium": "中", "high": "高", "max": "最高", "xhigh": "最高"}
-    cur_variants = (alias.get(current) or (None, None, None))[2] or []
-    if isinstance(cur_variants, str):
-        cur_variants = [cur_variants]
-    levels = [v for v in _ORDER if v in cur_variants] or list(_ORDER)
-    for v in cur_variants:
+    cur_key = None
+    if current and current in alias:
+        p_, m_ = alias[current][:2]
+        cur_key = f"{p_}/{m_}"
+    cur_values = list((levels_by_model.get(cur_key or "") or {}).get("values") or [])
+    if not cur_values:
+        var = (alias.get(current) or (None, None, None))[2]
+        cur_values = ([str(var)] if isinstance(var, str)
+                      else [str(v) for v in (var or [])])
+    levels = [v for v in _ORDER if v in cur_values] or list(_ORDER)
+    for v in cur_values:
         if v not in levels:
             levels.append(v)
     if "medium" not in levels:
         levels.append("medium")
-    current_thought = os.environ.get("ZCODE_ACP_THOUGHT", "medium")
+    if not current_thought:
+        current_thought = os.environ.get("ZCODE_ACP_THOUGHT", "medium")
     if current_thought not in levels:
         current_thought = levels[0]
     cfg_opts.append({
@@ -742,6 +1390,8 @@ class ZCode:
         # ACP session/new 透传的客户端 MCP（客户端自带 + 用户配置）。
         # 引擎把它当 per-load runtime 配置、不随会话持久化 → 每次 resume 都要重挂。
         self.mcp_servers = []
+        self.account_pushed = False   # 订阅快照是否已推给本引擎进程
+        self.live_entitled = None     # 本会话现场查到的权益（session/new 注入）
         self.workspace = None    # {workspacePath, workspaceKey} — 子会话激活(resume)要用
         # V4 网关(桌面同款实时通道):子会话的 token 级流只能从这里拿。
         # 见 _v4_frame 注释。
@@ -856,6 +1506,25 @@ class ZCode:
                         self._send({"id": mid, "result": {"nativeSearchEnhancementsEnabled": False}})
                     elif method == "interaction/requestOfficialMcpAuthHeaders":
                         self._send({"id": mid, "result": {"headersApplied": False}})
+                    elif method == "interaction/requestProviderRuntimeHeaders":
+                        # 订阅（zhipu-account）模型请求前引擎必向宿主要鉴权素材；
+                        # 不应答/答 false 会 -32031 重试风暴（社区实测）。
+                        # 注意：mid 是应答用的请求 id，别被 modelId 变量遮蔽！
+                        pr = m.get("params") or {}
+                        msel = pr.get("modelSelection") or {}
+                        pid = msel.get("providerId") or pr.get("providerId") or ""
+                        model_id = msel.get("modelId") or ""
+                        auth = coding_plan_request_auth(pid)
+                        if auth:
+                            log(f"provider runtime headers: {pid}/{model_id} "
+                                f"reason={pr.get('reason')} → 供鉴权")
+                            self._send({"id": mid, "result": {
+                                "headersApplied": True, "requestAuth": auth}})
+                        else:
+                            log(f"provider runtime headers: {pid}/{model_id} 无鉴权可用 → 拒绝")
+                            self._send({"id": mid, "result": {
+                                "headersApplied": False,
+                                "errorMessage": f"zcode-acp: no runtime auth for {pid}"}})
                     elif method == "interaction/requestPermission":
                         # 重发公告（reannounceIntervalMs=1s）共用同一 requestId：
                         # 决策一次，应答永远回最新公告的 server id
@@ -973,6 +1642,9 @@ class ZCode:
             log("session/create 透传 " + str(len(self.mcp_servers)) + " 个客户端 MCP: "
                 + ", ".join(str(s.get("name")) for s in self.mcp_servers
                             if isinstance(s, dict)))
+        # 订阅快照必须在 create 之前推：create 会对会话的模型选择做在册校验，
+        # account:* 渠道不在注册表时会被判"模型不可用"。
+        self._push_account_config()
         rid = self.next_id; self.next_id += 1
         self._send({"id": rid, "method": "session/create", "params": params})
         t0 = time.time()
@@ -1022,12 +1694,17 @@ class ZCode:
             if hit:
                 break
             time.sleep(0.3)
-        if MODEL:
-            mid = self.next_id; self.next_id += 1
-            prov, _, model = MODEL.partition("/")
-            self._send({"id": mid, "method": "session/setModel",
-                        "params": {"sessionId": self.session_id,
-                                   "model": {"providerId": prov, "modelId": model}}})
+        # 会话必须有模型选择：否则 prompt 报 "Select a model before continuing"、
+        # setThoughtLevel 报 "Select a model before choosing reasoning effort"。
+        # 优先显式 ZCODE_ACP_MODEL，其次目录解析出的当前模型（带推理档位下发）。
+        target = MODEL or LAST_CATALOG_CURRENT or ""
+        if target:
+            ent = (LAST_CATALOG_ALIAS or {}).get(target)
+            if ent:
+                self._set_model(ent[0], ent[1])
+            elif "/" in target:
+                prov, _, model = target.partition("/")
+                self._set_model(prov, model)
         return self.session_id
 
     def _read_messages(self, timeout=6):
@@ -2275,15 +2952,40 @@ class ZCode:
             ch["state_sent"] = True
             subagent_cb("state", zid, {"state": "failed"})
 
+    def _push_account_config(self, force=False):
+        """会话前把订阅快照推给引擎（桌面宿主 provider/updateAccountConfig）。
+
+        没有宿主推送时 account:* 渠道不进注册表——订阅模型不出现、也切不过去。
+        必须在 session/create 之前推：create 会对会话的模型选择做在册校验。
+        每个引擎进程推一次即可（resume 走新引擎时会补推）。"""
+        if self.account_pushed and not force:
+            return
+        try:
+            payload = build_account_provider_payload(getattr(self, "live_entitled", None))
+            if not payload:
+                return
+            r = self.engine_call_raw("provider/updateAccountConfig", payload, timeout=10)
+            if isinstance(r, dict):
+                self.account_pushed = True
+            if isinstance(r, dict) and isinstance(r.get("result"), dict):
+                res = r["result"]
+                ent = [pid for pid, st in (payload.get("states") or {}).items()
+                       if st.get("entitled")]
+                log(f"account snapshot pushed: providers={res.get('providerCount')} "
+                    f"status={res.get('status')} entitled={ent}")
+            elif isinstance(r, dict) and r.get("error"):
+                log("account snapshot push failed: "
+                    f"{json.dumps(r['error'], ensure_ascii=False)[:200]}")
+        except Exception as e:
+            log(f"account snapshot push error: {e}")
+
     def _set_model(self, provider_id, model_id, level=None, wait=5):
-        """setModel（模型有推理档位时带上 options——引擎 3.12+ 对有档位模型
-        强制要求 options，缺了会被判 reasoning-level-missing 直接拒）。"""
-        model = {"providerId": provider_id, "modelId": model_id}
-        if level:
-            model["options"] = {"reasoningLevel": level}
+        """带推理档位的 setModel（引擎 3.12+ 对有档位模型强制要求 options；
+        account:* 模型无 specs 时引擎也强制要求——model_selection 会解析出来）。"""
         rid = self.next_id; self.next_id += 1
         self._send({"id": rid, "method": "session/setModel",
-                    "params": {"sessionId": self.session_id, "model": model}})
+                    "params": {"sessionId": self.session_id,
+                               "model": model_selection(provider_id, model_id, level)}})
         deadline = time.time() + wait
         while time.time() < deadline:
             with self.lock:
@@ -2305,12 +3007,7 @@ class ZCode:
             model = cfg.get("model") or ""
             pid, _, mid = model.partition("/")
             if pid and mid:
-                rid = self.next_id; self.next_id += 1
-                self._send({"id": rid, "method": "session/setModel",
-                            "params": {"sessionId": self.session_id,
-                                       "model": {"providerId": pid, "modelId": mid}}})
-                time.sleep(1.5)
-                return True
+                return self._set_model(pid, mid)
         except Exception as e:
             log(f"model recover failed: {e}")
         return False
@@ -2766,6 +3463,9 @@ class AcpServer:
         self._out_lock = threading.Lock()   # 读者线程(事件)与 handle 线程共写 stdout
         self._prompt_lock = threading.Lock()  # 轮次串行:引擎拒绝 active 期间二次 send
         self._last_usage_meta = None       # (sid, meta_json)：usage 明细去重哨兵
+        self.current_thought = os.environ.get("ZCODE_ACP_THOUGHT", "medium")
+        self._live_entitled = None         # 本会话现场查到的权益（无缓存）
+        self._cred_fp = None               # 账号相关文件指纹（触发权益重算）
 
     def _deny_all_pending(self):
         """把所有还挂在客户端的权限请求按"取消"结算 —— 终止后弹着的框要收掉。"""
@@ -2849,10 +3549,25 @@ class AcpServer:
         elif method == "session/new":
             new_params = msg.get("params", {})
             cwd = new_params.get("cwd") or os.getcwd()
+            # 每次新会话实时查一次权益（无缓存；账号切换即时生效）。
+            # 与引擎启动并行跑，网络延迟不叠加到会话建立时间上。
+            live_box = {}
+            live_thread = threading.Thread(
+                target=lambda: live_box.update(live=live_entitled_plans()),
+                daemon=True)
+            live_thread.start()
             try:
-                self.catalog = zcode_model_catalog(self.permission_mode)
+                # 兜底目录先按本地信号构建（订阅以引擎 availability 为准，见下方 cat）
+                self.catalog = zcode_model_catalog(self.permission_mode,
+                                                   self.current_thought,
+                                                   live_entitled=set())
                 sync_channels_to_headless(self.catalog)
                 self.zcode = ZCode(cwd)
+                live_thread.join(timeout=7)
+                live = live_box.get("live")
+                self._live_entitled = live
+                self._cred_fp = _cred_fingerprint()
+                self.zcode.live_entitled = live
                 mcp_servers = new_params.get("mcpServers")
                 if isinstance(mcp_servers, list) and mcp_servers:
                     # IN 行截断在 400 字符，MCP 全量单独落 trace（排查用）
@@ -2867,7 +3582,13 @@ class AcpServer:
             self.zcode.ui_cb = self._on_user_input
             self.acp_session = "zc-" + zsid
             log(f"session ready: zcode={zsid} acp={self.acp_session}")
-            cat = zcode_model_catalog(self.permission_mode)
+            # 目录以引擎注册表为准（创建应答里的 settings.model.available 已 capture）
+            cat = zcode_model_catalog(self.permission_mode, self.current_thought,
+                                      engine_entries=MODEL_AVAIL_LIST,
+                                      live_entitled=live)
+            # 必须回写 self.catalog：set_config_option 的 alias 反查走这里，
+            # 不写回的话客户端拿到的列表和适配器解析用的是两套目录。
+            self.catalog = cat
             # 先把原生斜杠命令取到手（最多等几秒），让它们直接进 session/new 应答
             try:
                 wkey0 = (self.zcode.workspace or {}).get("workspaceKey")
@@ -2898,6 +3619,7 @@ class AcpServer:
                 self._send({"jsonrpc": "2.0", "id": rid, "error":
                             {"code": -32000, "message": "no active session"}})
                 return
+            self._refresh_entitlements_if_changed()
             text = "".join(c.get("text", "") for c in msg.get("params", {}).get("prompt", [])
                            if c.get("type") == "text")
             sid_acp = msg["params"]["sessionId"]
@@ -2984,6 +3706,7 @@ class AcpServer:
                 self.zcode._send({"id": zrid, "method": "session/setThoughtLevel",
                                   "params": {"sessionId": self.zcode.session_id,
                                              "thoughtLevel": value}})
+                self.current_thought = value
                 # 严格解析的客户端要求应答里带 configOptions 字段
                 # （missing field `configOptions`）
                 self._send({"jsonrpc": "2.0", "id": rid,
@@ -3007,7 +3730,7 @@ class AcpServer:
             zrid = self.zcode.next_id; self.zcode.next_id += 1
             self.zcode._send({"id": zrid, "method": "session/setModel",
                               "params": {"sessionId": self.zcode.session_id,
-                                         "model": {"providerId": prov, "modelId": model}}})
+                                         "model": model_selection(prov, model)}})
             deadline = time.time() + 30
             ok = False
             while time.time() < deadline:
@@ -3021,10 +3744,15 @@ class AcpServer:
                         return
                     break
                 time.sleep(0.3)
-            opts = self._catalog_opts()
-            self._send({"jsonrpc": "2.0", "id": rid, "result": {"configOptions": opts}})
-            # 引擎侧模型已变 → 推送 config_option_update 让客户端选择器同步
-            if ok and getattr(self, "catalog", None):
+            if ok:
+                # 目录重建：新模型的档位表/订阅列表可能不同；当前值钉回用户所选。
+                # 复用本会话建立时的现场结果（不在每次切模型时打网络）。
+                self.catalog = zcode_model_catalog(
+                    self.permission_mode, self.current_thought,
+                    engine_entries=MODEL_AVAIL_LIST,
+                    live_entitled=getattr(self, "_live_entitled", None))
+                self.current_thought = (self.catalog.get("currentThought")
+                                        or self.current_thought)
                 try:
                     for opt in self.catalog["configOptions"]:
                         if opt.get("id") == "model":
@@ -3032,10 +3760,10 @@ class AcpServer:
                             break
                 except Exception:
                     pass
-                self._send({"jsonrpc": "2.0", "method": "session/update", "params": {
-                    "sessionId": self.acp_session, "update": {
-                        "sessionUpdate": "config_option_update",
-                        "configOptions": self.catalog["configOptions"]}}})
+            self._send({"jsonrpc": "2.0", "id": rid,
+                        "result": {"configOptions": self._catalog_opts()}})
+            if ok:
+                self._push_config_options()
         elif method == "session/list":
             sessions = self._list_sessions(msg.get("params") or {})
             self._send({"jsonrpc": "2.0", "id": rid, "result": {"sessions": sessions}})
@@ -3328,6 +4056,35 @@ class AcpServer:
             "sessionId": self.acp_session, "update": {
                 "sessionUpdate": "config_option_update",
                 "configOptions": self.catalog["configOptions"]}}})
+
+    def _refresh_entitlements_if_changed(self):
+        """账号/订阅文件一变（登录切换、订阅变更）：实时重算 → 重推注册表 →
+        热更新客户端的模型列表。无变化时只做一次 mtime 比对，不打网络。"""
+        fp = _cred_fingerprint()
+        if fp == getattr(self, "_cred_fp", None):
+            return
+        self._cred_fp = fp
+        live = live_entitled_plans()   # 实时查（无缓存）
+        if live == getattr(self, "_live_entitled", None):
+            return
+        log("entitlement changed on disk: "
+            f"{sorted(getattr(self, '_live_entitled', None) or ())} → {sorted(live or ())}")
+        self._live_entitled = live
+        if not (self.zcode and self.zcode.session_id):
+            return
+        self.zcode.live_entitled = live
+        self.zcode._push_account_config(force=True)
+        try:
+            # 目录以**引擎注册表**为准（MODEL_AVAIL_LIST 是会话建立时抓的
+            # availability）：文件目录里有一批引擎根本物化不了的渠道
+            # （v2 config.json 的自定义渠道），推给客户端会显示出来却选不了。
+            # availability 为空时自动回落到文件目录（安全网）。
+            self.catalog = zcode_model_catalog(self.permission_mode, self.current_thought,
+                                               engine_entries=MODEL_AVAIL_LIST,
+                                               live_entitled=live)
+            self._push_config_options()
+        except Exception as e:
+            log(f"entitlement refresh catalog failed: {e}")
 
     def _catalog_value_for(self, provider_id, model_id):
         """(providerId, modelId) → 目录里的展示值（"渠道名/模型id"）；无则 None。"""
@@ -3642,6 +4399,14 @@ class AcpServer:
         try:
             cwd = params.get("cwd") or (self.zcode and self.zcode.cwd) or os.getcwd()
             zc = self._engine(cwd)
+            # 恢复前实时查一次权益（无缓存；账号切换即时生效），并把订阅快照
+            # 补推给这个新引擎进程——否则 account:* 渠道不在注册表，resume 的
+            # 会话模型会被判"不可用"（会话模型失效的常见根因）。
+            live = live_entitled_plans()
+            self._live_entitled = live
+            self._cred_fp = _cred_fingerprint()
+            zc.live_entitled = live
+            zc._push_account_config()
             # 会话身份 = 它自己的 workspace(path+key,list 记录里带)——
             # registry 推送和 resume 必须用同一个,否则引擎判模型不可用
             ws = {"workspacePath": cwd, "workspaceKey": "acp-list"}
@@ -3652,6 +4417,8 @@ class AcpServer:
                     ws = s["workspace"]
                     break
             # 前置:把 v2 渠道推给工作区(恢复 provider 注册表)
+            # 注：本引擎（3.15.x）没有 workspace/updateProviderRegistry 这个方法，
+            # 调用只会拿到 method-not-found；保留只是为了兼容旧引擎的残留路径。
             registry = _v2_registry()
             if registry:
                 rr = zc.engine_call("workspace/updateProviderRegistry",
@@ -3675,7 +4442,9 @@ class AcpServer:
             capture_availability(r)
             self._subscribe(zsid)
             self.acp_session = f"zc-{zsid}"
-            cat = zcode_model_catalog(self.permission_mode)
+            cat = zcode_model_catalog(self.permission_mode, self.current_thought,
+                                      engine_entries=MODEL_AVAIL_LIST,
+                                      live_entitled=live)
             self.catalog = cat
             # 会话模型失效自愈（2026-10-14 报障）：原模型离开 Provider
             # Registry 时（渠道被禁用 / 订阅权益变更），引擎恢复出的会话
@@ -3912,7 +4681,7 @@ class AcpServer:
 def main():
     argv = sys.argv[1:]
     if "--version" in argv or "-v" in argv:
-        print("zcode-acp 0.8.0 (local bridge to ZCode app-server; 事件驱动流式+claude 卡片契约+子代理V4实时流+_session/steering guide 注入+落盘时序对齐+终端登录向导)")
+        print("zcode-acp 0.9.0 (local bridge to ZCode app-server; 事件驱动流式+claude 卡片契约+子代理V4实时流+_session/steering guide 注入+落盘时序对齐+终端登录向导+引擎注册表/订阅权益目录)")
         return
     # Terminal Auth 入口：`--login` / `--setup`（initialize 的 authMethods
     # 里声明就是它）——安装/登录向导，做完即退出，不进 ACP 服务循环。

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{ name = "zcode-acp contributors" }]
+authors = [{ name = "Liang-HZ" }]
 keywords = ["acp", "agent-client-protocol", "zcode", "adapter", "json-rpc", "macos"]
 classifiers = [
   "Development Status :: 4 - Beta",

@@ -179,6 +179,19 @@ def catalog_context_window(provider_id, model_id):
     return None
 
 
+def is_model_selection_failure(text):
+    """「会话没有模型选择」类失败的指纹（引擎 Turn 的 model_creation 阶段）。
+
+    引擎侧原始错误：CONFIGURATION_ERROR / "Select a model before continuing"
+    （detail "Model creation failed"）。触发条件 = 会话的模型选择为空或
+    不在 Provider Registry——恢复后的会话里原模型随渠道禁用/订阅变更退场，
+    就是这个局面。识别它才能自愈重试（见 AcpServer._heal_session_model）。"""
+    t = (text or "").lower()
+    return ("select a model before continuing" in t
+            or "model creation failed" in t
+            or "select a model before choosing reasoning effort" in t)
+
+
 # ---------------------------------------------------------------- ZCode client
 
 def zcode_model_catalog(current_mode="default"):
@@ -205,11 +218,26 @@ def zcode_model_catalog(current_mode="default"):
 
     try:
         v2 = json.load(open(os.path.expanduser("~/.zcode/v2/config.json")))
+        # personal 渠道的用户停用状态在 provider_config.json（enabled=false
+        # 就是桌面设置页里的"停用"）。legacy config.json 对同一渠道可能
+        # enabled=None——不能因此把它当"可用"顶回目录（2026-10-14 实障：
+        # 没启用的"公司模型网关"一直显示在客户端）。
+        personal_disabled = set()
+        try:
+            with open(os.path.expanduser("~/.zcode/v2/provider_config.json")) as f:
+                _pcfg = json.load(f)
+            for _r in (((_pcfg.get("config") or {}).get("providerConfigRules") or {})
+                       .get("providerRules") or []):
+                if isinstance(_r, dict) and _r.get("enabled") is False \
+                        and _r.get("providerId"):
+                    personal_disabled.add(_r["providerId"])
+        except Exception:
+            pass
         # 先按桌面菜单顺序：enabled=True 在前，其后 enabled=None（自定义默认可用）
         entries = list((v2.get("provider") or {}).items())
         entries.sort(key=lambda kv: 0 if kv[1].get("enabled") is True else 1)
         for pid, pc in entries:
-            if pc.get("enabled") is False:
+            if pc.get("enabled") is False or pid in personal_disabled:
                 continue
             if pc.get("systemDisabledReason"):
                 continue
@@ -465,6 +493,124 @@ def find_node():
     return "node"
 
 
+def resolve_builtin_table_path():
+    """内置 provider 表路径（engine 3.12.3+ 需宿主显式注入）。
+
+    缺失时引擎以「无法定位 CLI ZCode Built-in Provider Config」退出，
+    session/create 静默超时 60s（2026-10-13 引擎升级到 3.15 后实测）。
+    桌面 App 同款做法：从 CLI 所在 App 目录推导内置表路径。"""
+    p = os.environ.get("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE")
+    if p and os.path.isfile(p):
+        return p
+    cand = os.path.join(os.path.dirname(os.path.dirname(ZC_CJS)),
+                        "config", "provider", "zcode-builtin.json")
+    if os.path.isfile(cand):
+        return cand
+    import glob as _glob
+    runs = sorted(_glob.glob(os.path.expanduser(
+        "~/.zcode/v2/runtime/provider/*/*/*/zcode-builtin.json")))
+    return runs[-1] if runs else None
+
+
+def resolve_personal_provider_config():
+    """personal provider 配置路径——**原样**注入，不做任何改写。
+
+    桌面宿主注入的就是 ~/.zcode/v2/provider_config.json 本身（out/host 的
+    personalFilePath = join(appDataDir, "provider_config.json")），而引擎
+    把规则的 enabled 当开关。2026-10-14 实测：原始文件里 deepseek=true、
+    公司模型网关=false → 引擎注册表只出 DeepSeek，公司模型网关不出现——
+    与桌面模型菜单一致。
+
+    曾经"按 config.json 强制启用"的改写是错的：config.json（legacy）里
+    公司模型网关 enabled=None，被误当成"用户要启用"，把桌面里明确停用的
+    渠道硬顶进客户端目录。enabled 的真值就在这个文件里，由桌面设置页维护。"""
+    src = os.path.expanduser("~/.zcode/v2/provider_config.json")
+    return src if os.path.isfile(src) else None
+
+
+# ACP 认证方式（Registry 收录的硬性条件：initialize 必须广告至少一种）。
+# 这里声明 **Terminal Auth**：ZCode 的账号/订阅登录都发生在桌面客户端里，
+# 适配器不代理 API、不搬 key，只做「安装检测 → 登录检测 → 没登录就打开
+# 桌面端并等它登录完成」。客户端（Zed / JetBrains / codeg 等）据此可以
+# 给用户一个"Log in to ZCode"入口，跑 `zcode-acp --login`。
+AUTH_METHODS = [{
+    "id": "zcode-login",
+    "name": "Log in to ZCode",
+    "description": ("Sign in through the ZCode desktop app. The adapter then "
+                    "drives your local ZCode engine with your own ZCode "
+                    "subscription; no API keys are proxied."),
+    "type": "terminal",
+    "args": ["--login"],
+}]
+
+CRED_PATH = os.path.expanduser("~/.zcode/v2/credentials.json")
+
+
+def zcode_login_ready():
+    """本机 ZCode 是否"已就绪"（有登录会话或可用渠道）。
+
+    不解密凭据：只看 credentials.json 里有没有 oauth/会话键（值可为
+    enc:v1 密文，存在即视为已登录），回落到 v2 config.json 里
+    "启用且填了 key" 的渠道。"""
+    try:
+        with open(CRED_PATH) as f:
+            creds = json.load(f)
+        for k in ("oauth:zai:access_token", "oauth:bigmodel:access_token",
+                  "zcodejwttoken"):
+            v = creds.get(k)
+            if isinstance(v, str) and v.strip():
+                return True
+    except Exception:
+        pass
+    try:
+        with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
+            v2 = json.load(f)
+        for _pid, pc in (v2.get("provider") or {}).items():
+            if (pc or {}).get("enabled") is not False \
+                    and ((pc.get("options") or {}).get("apiKey")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def login_flow(timeout=None):
+    """终端登录向导（Terminal Auth 的 `--login` 入口）。
+
+    退出码：0 = 已就绪；1 = 未就绪（缺引擎 / 超时未登录）。
+    非 macOS / 找不到 ZCode.app 时给出明确指引，不乱开进程。"""
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("ZCODE_ACP_LOGIN_TIMEOUT", "300"))
+        except ValueError:
+            timeout = 300.0
+    print("zcode-acp login wizard")
+    if not os.path.isfile(ZC_CJS):
+        print(f"  ✗ ZCode engine not found at {ZC_CJS}")
+        print("    Install the ZCode desktop app first, or point ZCODE_CJS at "
+              "your zcode.cjs.")
+        return 1
+    if zcode_login_ready():
+        print("  ✓ ZCode is installed and signed in — you're ready to go.")
+        return 0
+    print("  → Opening the ZCode desktop app. Complete sign-in there "
+          "(subscription or API key); this wizard waits for it…")
+    try:
+        subprocess.Popen(["open", "-a", "ZCode"])
+    except Exception as e:
+        print(f"    (could not open ZCode automatically: {e})")
+        print("    Please start the ZCode app manually.")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        if zcode_login_ready():
+            print("  ✓ Signed in — ZCode is ready.")
+            return 0
+    print(f"  ✗ Still not signed in after {int(timeout)}s. "
+          "Sign in in the ZCode app, then retry `zcode-acp --login`.")
+    return 1
+
+
 def engine_env():
     """引擎进程环境（唯一改动点：过长的 TMPDIR 换短目录）。
 
@@ -484,6 +630,18 @@ def engine_env():
             log(f"engine TMPDIR 过长（{len(td)}字符）→ 换用 {short}")
         except Exception as e:
             log(f"engine TMPDIR 替换失败（{e}），沿用 {td}")
+    # ZCode 3.12.3+：内置 CLI 需要宿主注入 provider 表（桌面 App 同款做法）。
+    # 缺失时引擎以「无法定位 CLI ZCode Built-in Provider Config」退出，
+    # session/create 静默超时 60s。personal 表原样注入（enabled 就是桌面
+    # 设置页的开关，详见图 resolve_personal_provider_config）。
+    builtin = resolve_builtin_table_path()
+    if builtin:
+        env["ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"] = builtin
+        log(f"engine provider env: builtin={builtin}")
+    personal = resolve_personal_provider_config()
+    if personal:
+        env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = personal
+        log(f"engine provider env: personal={personal}")
     return env
 
 
@@ -883,7 +1041,9 @@ class ZCode:
                 resp = next((m for m in reversed(self.log) if m.get("id") == rid), None)
             if resp is not None and ("result" in resp or "error" in resp):
                 return resp.get("result") if isinstance(resp.get("result"), dict) else None
-            time.sleep(0.2)
+            # 紧凑轮询：这也是轮开始前的基线快照，0.2s 粒度会推迟「轮开始」
+            # 的可观测时间（见 query_usage 同款注释）。
+            time.sleep(0.02)
         return None
 
     def _snapshot_message_ids(self):
@@ -911,9 +1071,8 @@ class ZCode:
         兜底通道(每 2s session/read + 基线过滤):补工具卡、补漏段;
         历史消息(基线内)一律跳过,不重放。
         返回:本轮最终正文文本。"""
-        baseline = self._snapshot_message_ids()
         st = {
-            "baseline": baseline,
+            "baseline": set(),
             "tools": {},         # toolCallId -> {"name","status","announced"}
             "text_emitted": {},  # assistantMessageId -> 已流出的正文字符数
             "thought_emitted": {},
@@ -923,7 +1082,12 @@ class ZCode:
             "failed": None,
             "stopped": False,
         }
+        # 轮已经"开始"：steer / 取消 / 权限的"有无活动轮"判断都看 _turn。
+        # 基线快照(session/read)还有一次往返——晚这几百毫秒会让贴着
+        # prompt 就发出的 steer 被误判成 noRunningTurn（promptRequired），
+        # 而不是进入"等落盘信号再注入"的正轨（test_steering 时序用例钉住）。
         self._turn = st
+        st["baseline"] = self._snapshot_message_ids()
 
         def note_agent_input(tid, name, inp):
             """父会话里 Agent/Task 工具的派发入参（description/prompt/subagent_type）
@@ -2111,6 +2275,29 @@ class ZCode:
             ch["state_sent"] = True
             subagent_cb("state", zid, {"state": "failed"})
 
+    def _set_model(self, provider_id, model_id, level=None, wait=5):
+        """setModel（模型有推理档位时带上 options——引擎 3.12+ 对有档位模型
+        强制要求 options，缺了会被判 reasoning-level-missing 直接拒）。"""
+        model = {"providerId": provider_id, "modelId": model_id}
+        if level:
+            model["options"] = {"reasoningLevel": level}
+        rid = self.next_id; self.next_id += 1
+        self._send({"id": rid, "method": "session/setModel",
+                    "params": {"sessionId": self.session_id, "model": model}})
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            with self.lock:
+                r = next((m for m in self.log if m.get("id") == rid), None)
+            if r is not None:
+                if "error" in r:
+                    log(f"setModel {provider_id}/{model_id} 被拒: "
+                        f"{json.dumps(r.get('error'), ensure_ascii=False)[:220]}")
+                    return False
+                return True
+            time.sleep(0.15)
+        log(f"setModel {provider_id}/{model_id} 无应答")
+        return False
+
     def _recover_model(self):
         """resume 后原模型不可用时:切到 headless 配置的默认模型(已物化)。"""
         try:
@@ -2447,7 +2634,10 @@ class ZCode:
                 r = next((m for m in reversed(self.log) if m.get("id") == rid), None)
             if r is not None and isinstance(r.get("result"), dict):
                 return r["result"]
-            time.sleep(0.3)
+            # 紧凑轮询：启动路径（轮开始前）用它取基线，0.3s 粒度会让"轮开始"
+            # 对外可见推迟~300ms，贴着 session/new 发的 steer 会被误判成
+            # noRunningTurn（test_steering 的落盘时序用例钉住这一点）。
+            time.sleep(0.02)
         return None
 
     def _latest_context_used(self):
@@ -2629,7 +2819,7 @@ class AcpServer:
                 "agentCapabilities": {"loadSession": False,
                                        "promptCapabilities": {"embeddedContext": False}},
                 "sessionCapabilities": {"list": {}, "resume": {}, "fork": {}, "close": {}},
-                "authMethods": [],
+                "authMethods": AUTH_METHODS,
                 # steering 扩展广告（顶层 _meta，与 claude-agent-acp / codex-acp
                 # 同位置）。supported 之外的字段是本适配器实测出来的投递事实，
                 # 供编排层直接生成 capability descriptor，见 README。
@@ -2642,6 +2832,20 @@ class AcpServer:
                                         "idle": "promptRequired",
                                         "settlesOwnerTurn": False,
                                         "outcomes": list(STEERING_OUTCOMES)}}}})
+        elif method == "authenticate":
+            # ACP 认证请求（客户端点了 "Log in to ZCode"）。适配器只做状态
+            # 校验：已就绪 → 成功；未登录 → 报错并指引 `--login`/桌面端。
+            mid = (msg.get("params") or {}).get("methodId") or ""
+            if mid and mid not in [m["id"] for m in AUTH_METHODS]:
+                self._send({"jsonrpc": "2.0", "id": rid, "error":
+                            {"code": -32602, "message": f"unknown auth method: {mid}"}})
+            elif zcode_login_ready():
+                self._send({"jsonrpc": "2.0", "id": rid, "result": {}})
+            else:
+                self._send({"jsonrpc": "2.0", "id": rid, "error": {
+                    "code": -32000,
+                    "message": "ZCode is not signed in. Run `zcode-acp --login` "
+                               "or sign in in the ZCode desktop app, then retry."}})
         elif method == "session/new":
             new_params = msg.get("params", {})
             cwd = new_params.get("cwd") or os.getcwd()
@@ -3030,12 +3234,27 @@ class AcpServer:
         sub_tool_names = {}
 
         self.zcode.turn_active = True
+
+        def send_turn():
+            return self.zcode.send(text, on_update=emit, thought_cb=think,
+                                   usage_cb=lambda u: self._send_usage(sid_acp, u),
+                                   tool_cb=tool_cb, subagent_cb=subagent_cb)
+
         try:
             # 本轮用量基线：PromptResponse.usage 用逐轮差值（见 _turn_usage）。
             usage_before = self.zcode.query_usage() if rid is not None else None
-            final = self.zcode.send(text, on_update=emit, thought_cb=think,
-                                    usage_cb=lambda u: self._send_usage(sid_acp, u),
-                                    tool_cb=tool_cb, subagent_cb=subagent_cb)
+            try:
+                final = send_turn()
+            except Exception as e:
+                # 模型选择失效自愈（2026-10-14 报障）：失败发生在 model_creation
+                # 阶段、整轮零输出（emitted 为 0），切到在册模型后原样重发一次；
+                # 第二次再失败才把错误上抛给客户端。
+                if emitted["n"] != 0 or not is_model_selection_failure(str(e)):
+                    raise
+                log(f"turn failed at model selection → heal + retry: {str(e)[:200]}")
+                if not self._heal_session_model():
+                    raise
+                final = send_turn()
             if emitted["n"] == 0 and final:
                 emit(final)
             stop = "cancelled" if (self.zcode._turn or {}).get("stopped") else "end_turn"
@@ -3100,6 +3319,113 @@ class AcpServer:
 
     def _catalog_opts(self):
         return (getattr(self, "catalog", {}) or {}).get("configOptions") or []
+
+    def _push_config_options(self):
+        """主动推 config_option_update：客户端用快照对齐选择器（模型/档位）。"""
+        if not (self.acp_session and getattr(self, "catalog", None)):
+            return
+        self._send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": self.acp_session, "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": self.catalog["configOptions"]}}})
+
+    def _catalog_value_for(self, provider_id, model_id):
+        """(providerId, modelId) → 目录里的展示值（"渠道名/模型id"）；无则 None。"""
+        alias = (getattr(self, "catalog", {}) or {}).get("alias") or {}
+        for value, ent in alias.items():
+            if ent and ent[0] == provider_id and ent[1] == model_id:
+                return value
+        return None
+
+    def _sync_catalog_model(self, provider_id, model_id):
+        """把目录的模型 currentValue 钉到 (providerId, modelId) 并推给客户端。"""
+        cat = getattr(self, "catalog", None)
+        if not isinstance(cat, dict):
+            return
+        value = self._catalog_value_for(provider_id, model_id)
+        opts = cat.get("configOptions") or []
+        mopt = next((o for o in opts if o.get("id") == "model"), None)
+        if mopt is None:
+            return
+        values = [str(o.get("value")) for o in (mopt.get("options") or [])]
+        if value is None:
+            # 引擎里才有的模型（目录 alias 没有）：补进选项——currentValue
+            # 不在 options 里时，严格解析的客户端会当作值失效直接跳过。
+            value = f"{provider_id}/{model_id}"
+        if value not in values:
+            mopt["options"] = list(mopt.get("options") or []) + [
+                {"value": value, "name": value.split("/")[-1]}]
+        mopt["currentValue"] = value
+        cat["currentModelId"] = value
+        self._push_config_options()
+
+    def _heal_session_model(self):
+        """把会话模型切到一个**当下在册**的值（会话模型失效时的自愈）。
+
+        场景（2026-10-14 报障）：会话原模型随渠道禁用/订阅变更离开
+        Provider Registry → 引擎恢复会话时 `settings.model.current` 为空
+        → 下一轮在 model_creation 阶段即失败（CONFIGURATION_ERROR
+        "Select a model before continuing"，detail "Model creation failed"），
+        整轮零输出。客户端只看到消息一发出去就 "zcode turn failed: {...}"。
+
+        候选顺序（逐个真的 setModel，被引擎拒就试下一个，全不行返回 None）：
+          1) 目录当前模型（保住客户端选择器显示的值；在册与否由 setModel 裁决）
+          2) 引擎 availability 里第一个无 disabledReason 的模型（已物化）
+          3) cli config.json 的默认 model
+        成功 → 同步目录 currentValue + 推 config_option_update。"""
+        zc = getattr(self, "zcode", None)
+        if not (zc and zc.session_id):
+            return None
+        cands, seen = [], set()
+
+        def push(pid, mid):
+            if pid and mid:
+                key = (str(pid), str(mid))
+                if key not in seen:
+                    seen.add(key)
+                    cands.append(key)
+
+        cat = getattr(self, "catalog", {}) or {}
+        alias = cat.get("alias") or {}
+        cur = cat.get("currentModelId") or ""
+        ent = alias.get(cur)
+        if ent:
+            push(ent[0], ent[1])
+        elif "/" in cur:
+            pid, _, mid = cur.partition("/")
+            push(pid, mid)
+        for e in list(MODEL_AVAIL_LIST):
+            e = e if isinstance(e, dict) else {}
+            ref = (e.get("ref") or e) if isinstance(e, dict) else {}
+            if e.get("disabledReason"):
+                continue
+            push(ref.get("providerId"), ref.get("modelId"))
+        try:
+            with open(os.path.expanduser("~/.zcode/cli/config.json")) as f:
+                cur2 = (json.load(f).get("model") or "")
+            if "/" in cur2:
+                pid, _, mid = cur2.partition("/")
+                push(pid, mid)
+        except Exception as e:
+            log(f"heal: cli default read failed: {e}")
+        for pid, mid in cands:
+            variants = None
+            for _ent in alias.values():
+                if _ent and _ent[0] == pid and _ent[1] == mid:
+                    variants = _ent[2] if len(_ent) > 2 else None
+                    break
+            if isinstance(variants, str):
+                level = variants
+            elif isinstance(variants, (list, tuple)) and variants:
+                level = str(variants[0])
+            else:
+                level = None
+            if zc._set_model(pid, mid, level=level):
+                log(f"session model healed → {pid}/{mid}")
+                self._sync_catalog_model(pid, mid)
+                return (pid, mid)
+        log(f"session model heal failed（{len(cands)} 个候选都被引擎拒绝）")
+        return None
 
     def _engine(self, cwd):
         """确保有引擎客户端（session/list 等可能发生在 session/new 之前）。"""
@@ -3351,6 +3677,17 @@ class AcpServer:
             self.acp_session = f"zc-{zsid}"
             cat = zcode_model_catalog(self.permission_mode)
             self.catalog = cat
+            # 会话模型失效自愈（2026-10-14 报障）：原模型离开 Provider
+            # Registry 时（渠道被禁用 / 订阅权益变更），引擎恢复出的会话
+            # `settings.model.current` 为空，下一轮必以 "Select a model
+            # before continuing" 死掉。恢复即修，别等用户打一轮才踩。
+            settings = (r or {}).get("settings") if isinstance(r, dict) else None
+            cur_sel = (((settings or {}).get("model") or {}).get("current")
+                       if isinstance(settings, dict) else None)
+            if not cur_sel:
+                log("resume: engine session has no current model "
+                    "(stale selection) → healing")
+                self._heal_session_model()
             return {"sessionId": self.acp_session,
                     "models": {"availableModels": cat["availableModels"],
                                 "currentModelId": cat["currentModelId"]},
@@ -3575,8 +3912,12 @@ class AcpServer:
 def main():
     argv = sys.argv[1:]
     if "--version" in argv or "-v" in argv:
-        print("zcode-acp 0.7.0 (local bridge to ZCode app-server; 事件驱动流式+claude 卡片契约+子代理V4实时流+_session/steering guide 注入+落盘时序对齐)")
+        print("zcode-acp 0.8.0 (local bridge to ZCode app-server; 事件驱动流式+claude 卡片契约+子代理V4实时流+_session/steering guide 注入+落盘时序对齐+终端登录向导)")
         return
+    # Terminal Auth 入口：`--login` / `--setup`（initialize 的 authMethods
+    # 里声明就是它）——安装/登录向导，做完即退出，不进 ACP 服务循环。
+    if argv and argv[0] in ("--login", "--setup"):
+        return login_flow()
     # 双模式：`run ...` = opencode 兼容的一次性 NDJSON 模式；
     # 无参数 = 常驻 ACP 服务器（stdio）
     if argv and argv[0] == "run":

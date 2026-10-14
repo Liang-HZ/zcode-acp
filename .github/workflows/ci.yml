@@ -1,0 +1,36 @@
+name: CI
+
+# The full suite (tests/) drives a real ZCode engine + a signed-in account, so it
+# only runs locally. This workflow covers what a hosted runner can verify:
+# compile + CLI smoke + the hermetic model-layer unit tests.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    env:
+      ZCODE_ACP_SKIP_ENGINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile
+        run: python -m py_compile zcode_acp.py tools/zcode_compat_check.py
+
+      - name: CLI smoke
+        run: python zcode_acp.py --version
+
+      - name: Hermetic unit tests (no engine needed)
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests/test_model_layer.py -q

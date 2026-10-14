@@ -18,9 +18,9 @@ jobs:
     env:
       ZCODE_ACP_SKIP_ENGINE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 

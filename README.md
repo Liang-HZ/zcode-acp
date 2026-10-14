@@ -1,5 +1,7 @@
 # zcode-acp
 
+[![CI](https://github.com/Liang-HZ/zcode-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/Liang-HZ/zcode-acp/actions/workflows/ci.yml)
+
 **把 ZCode 桌面客户端的私有引擎协议桥接成标准 ACP（Agent Client Protocol），让任何 ACP 客户端都能驱动 ZCode。**
 
 [中文](#中文) · [English](#english)

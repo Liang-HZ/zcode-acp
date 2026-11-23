@@ -28,6 +28,19 @@ def test_initialize_advertises_steering(client):
     assert "injected" in st["outcomes"] and "promptRequired" in st["outcomes"]
 
 
+def test_initialize_reports_agent_info(client):
+    """`agentInfo` —— ACP schema 的 Implementation。codeg 的 steering 白名单
+    按 `agentInfo.name` 选政策（P2），缺了它 zcode-acp 永远只能走 pull/队列；
+    version 取本包元数据，客户端按它做"跑着的二进制是不是这个版本"的证明。"""
+    import zcode_acp
+
+    info = client.initialize()["agentInfo"]
+    assert info["name"] == "zcode-acp"
+    assert info["version"] == zcode_acp.adapter_version()
+    assert info["version"] != "unknown", "包元数据或 pyproject 必须至少有一个"
+
+
+
 def test_session_new_shape(session):
     client, sid = session
     assert sid.startswith("zc-")

@@ -35,6 +35,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import selectors
 import subprocess
@@ -42,6 +43,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -226,28 +229,340 @@ def _b64url(data):
     return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
-def zcode_credential(name):
-    """读 ~/.zcode/v2/credentials.json 的解密值（enc:v1 = AES-256-GCM）。
+def _b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
-    密钥 = sha256(ZCODE_CREDENTIAL_SECRET 或确定性回退串)。本机未设环境变量，
-    回退串即真实密钥（与桌面/CLI 同源）→ 桥可以读 zcodejwttoken 等凭据。
-    缺失/解密失败返回 None（调用方按"无鉴权"降级）。"""
+
+_CRED_MAX_PLAIN_BYTES = 1048576
+_CRED_KEYRING_SERVICE = "ZCode Credential Encryption"
+_B64URL_SEG_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+_B64URL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_FP24_RE = re.compile(r"^[a-f0-9]{24}$")
+_OS_KEYRING_CACHE = {}
+_OS_KEYRING_LOCK = threading.Lock()
+
+
+class _CredentialError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _cred_storage_unavailable():
+    return _CredentialError(
+        "CREDENTIAL_SECURE_STORAGE_UNAVAILABLE",
+        "System credential storage is unavailable.",
+    )
+
+
+def _cred_invalid():
+    return _CredentialError(
+        "ZCODE_CREDENTIAL_DECRYPT_FAILED",
+        "凭据解密失败：Invalid encrypted credential",
+    )
+
+
+def _zcode_v2_dir():
+    base = (os.environ.get("ZCODE_DATA_BASE_DIR") or "").strip()
+    if base:
+        return os.path.abspath(os.path.join(os.path.expanduser(base), ".zcode", "v2"))
+    return os.path.abspath(os.path.expanduser("~/.zcode/v2"))
+
+
+def _zcode_credentials_path():
+    return os.path.join(_zcode_v2_dir(), "credentials.json")
+
+
+def _key_fp24(key_bytes):
+    return hashlib.sha256(key_bytes).hexdigest()[:24]
+
+
+def _managed_secret(cred_path, allow_sibling=False):
+    sec = os.environ.get("ZCODE_CREDENTIAL_SECRET") or ""
+    sec_file = os.environ.get("ZCODE_CREDENTIAL_SECRET_FILE") or ""
+    if sec and sec_file:
+        raise _cred_storage_unavailable()
+    if sec:
+        return sec
+    if not sec_file and not allow_sibling:
+        return None
+    target = sec_file or os.path.join(os.path.dirname(os.path.abspath(cred_path)),
+                                      "credential-secret")
     try:
-        path = os.path.expanduser("~/.zcode/v2/credentials.json")
-        with open(path) as f:
+        st = os.stat(target)
+    except OSError as e:
+        if not sec_file and e.errno == 2:
+            return None
+        raise _cred_storage_unavailable()
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        raise _cred_storage_unavailable()
+    if not sec_file and sys.platform != "win32" and (st.st_mode & 0o077) != 0:
+        raise _cred_storage_unavailable()
+    try:
+        with open(target, encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        raise _cred_storage_unavailable()
+    nbytes = len(text.encode("utf-8"))
+    if nbytes < 32 or nbytes > 4096:
+        raise _cred_storage_unavailable()
+    return text
+
+
+def _read_os_keyring_raw(account_hex):
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["/usr/bin/security", "find-generic-password",
+                 "-s", _CRED_KEYRING_SERVICE, "-a", account_hex, "-w"],
+                stderr=subprocess.DEVNULL, text=True, timeout=5,
+            ).strip()
+            return out or None
+        except Exception:
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            out = subprocess.check_output(
+                ["secret-tool", "lookup", "service", _CRED_KEYRING_SERVICE,
+                 "username", account_hex],
+                stderr=subprocess.DEVNULL, text=True, timeout=5,
+            ).strip()
+            return out or None
+        except Exception:
+            return None
+    return None
+
+
+def _os_keyring_key(cred_path, expected_fp=None):
+    abs_p = os.path.abspath(cred_path)
+    real_p = os.path.realpath(cred_path)
+    with _OS_KEYRING_LOCK:
+        cached = _OS_KEYRING_CACHE.get(abs_p)
+        if cached is not None and (expected_fp is None or _key_fp24(cached) == expected_fp):
+            return cached
+        if cached is not None and expected_fp is not None:
+            _OS_KEYRING_CACHE.pop(abs_p, None)
+    candidates = [abs_p] if real_p == abs_p else [abs_p, real_p]
+    for p in candidates:
+        acct = hashlib.sha256(p.encode("utf-8")).hexdigest()
+        b64 = _read_os_keyring_raw(acct)
+        if not b64 or not _B64URL_KEY_RE.match(b64):
+            continue
+        raw = _b64url(b64)
+        if len(raw) != 32:
+            continue
+        if expected_fp is not None and _key_fp24(raw) != expected_fp:
+            continue
+        with _OS_KEYRING_LOCK:
+            _OS_KEYRING_CACHE[abs_p] = raw
+        return raw
+    raise _cred_storage_unavailable()
+
+
+def _resolve_v2_key(cred_path, expected_source=None, expected_fp=None):
+    abs_p = os.path.abspath(cred_path)
+    managed = _managed_secret(abs_p, allow_sibling=False)
+    if managed is not None:
+        key = hashlib.sha256(managed.encode("utf-8")).digest()
+        if (expected_source and expected_source != "env") or (
+                expected_fp and _key_fp24(key) != expected_fp):
+            raise _cred_storage_unavailable()
+        return key, "env", managed
+
+    source_file = os.path.join(os.path.dirname(abs_p), "credential-source")
+    source_marker = None
+    try:
+        with open(source_file, encoding="utf-8") as f:
+            source_marker = f.read()
+    except FileNotFoundError:
+        source_marker = None
+    except OSError:
+        raise _cred_storage_unavailable()
+    if source_marker is not None and source_marker != "os\n":
+        raise _cred_storage_unavailable()
+
+    cred_text = ""
+    try:
+        with open(abs_p, encoding="utf-8") as f:
+            cred_text = f.read()
+    except FileNotFoundError:
+        cred_text = ""
+    except OSError:
+        raise _cred_storage_unavailable()
+
+    has_os = (source_marker is not None) or ("enc:v2:os:" in cred_text)
+    if not has_os:
+        sib = _managed_secret(abs_p, allow_sibling=True)
+        if sib is not None:
+            key = hashlib.sha256(sib.encode("utf-8")).digest()
+            if (expected_source and expected_source != "env") or (
+                    expected_fp and _key_fp24(key) != expected_fp):
+                raise _cred_storage_unavailable()
+            return key, "env", sib
+        if ("enc:v2:env:" in cred_text) or (expected_source == "env"):
+            raise _cred_storage_unavailable()
+    if expected_source == "env":
+        raise _cred_storage_unavailable()
+    key = _os_keyring_key(abs_p, expected_fp=expected_fp)
+    return key, "os", None
+
+
+def _aes_gcm_encrypt(plaintext, key_bytes):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    iv = os.urandom(12)
+    out = AESGCM(key_bytes).encrypt(iv, plaintext.encode("utf-8"), None)
+    ct, tag = out[:-16], out[-16:]
+    return ".".join((_b64url_encode(iv), _b64url_encode(tag), _b64url_encode(ct)))
+
+
+def _aes_gcm_decrypt(payload, key_bytes):
+    parts = payload.split(".")
+    if len(parts) != 3 or any(not _B64URL_SEG_RE.match(p) for p in parts):
+        raise _cred_invalid()
+    try:
+        iv, tag, ct = [_b64url(p) for p in parts]
+    except Exception:
+        raise _cred_invalid()
+    if len(iv) != 12 or len(tag) != 16:
+        raise _cred_invalid()
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        return AESGCM(key_bytes).decrypt(iv, ct + tag, None).decode("utf-8")
+    except Exception:
+        raise _cred_invalid()
+
+
+def _legacy_v1_keys(legacy_secret=None):
+    plat = "darwin" if sys.platform == "darwin" else (
+        "win32" if sys.platform == "win32" else sys.platform)
+    home = os.path.expanduser("~")
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+    fb = f"zcode-credential-fallback:{plat}:{home}:{user}"
+    raw_sec = legacy_secret if legacy_secret is not None else os.environ.get("ZCODE_CREDENTIAL_SECRET")
+    seen, keys = [], []
+    for cand in (raw_sec or fb, (raw_sec.strip() if raw_sec else "") or fb, fb):
+        if cand not in seen:
+            seen.append(cand)
+            keys.append(hashlib.sha256(cand.encode("utf-8")).digest())
+    return keys
+
+
+def zcode_cipher_encrypt(plaintext, cred_path=None):
+    if not isinstance(plaintext, str) or len(plaintext.encode("utf-8")) > _CRED_MAX_PLAIN_BYTES:
+        raise _cred_invalid()
+    path = cred_path or _zcode_credentials_path()
+    key, source, _ = _resolve_v2_key(path)
+    return f"enc:v2:{source}:{_key_fp24(key)}:{_aes_gcm_encrypt(plaintext, key)}"
+
+
+def zcode_cipher_decrypt(value, cred_path=None):
+    if not isinstance(value, str):
+        raise _cred_invalid()
+    path = cred_path or _zcode_credentials_path()
+    if value.startswith("enc:v2:"):
+        segs = value[7:].split(":")
+        if (len(segs) != 3 or segs[0] not in ("os", "env")
+                or not _FP24_RE.match(segs[1]) or not segs[2]):
+            raise _cred_invalid()
+        key, source, _ = _resolve_v2_key(path, expected_source=segs[0], expected_fp=segs[1])
+        if source != segs[0] or _key_fp24(key) != segs[1]:
+            raise _cred_storage_unavailable()
+        return _aes_gcm_decrypt(segs[2], key)
+    if value.startswith("enc:v1:"):
+        legacy_sec = None
+        try:
+            _, _, legacy_sec = _resolve_v2_key(path)
+        except _CredentialError:
+            pass
+        for k in _legacy_v1_keys(legacy_sec):
+            try:
+                return _aes_gcm_decrypt(value[7:], k)
+            except _CredentialError:
+                continue
+        raise _cred_invalid()
+    if value.startswith("enc:"):
+        raise _cred_invalid()
+    return value
+
+
+def handle_credential_cipher_request(params, cred_path=None):
+    """应答引擎 interaction/requestCredentialCipher（HJ schema）。"""
+    p = _d(params)
+    req_id = str(p.get("requestId") or "")
+    op = p.get("operation")
+    val = p.get("value")
+    try:
+        if op == "encrypt":
+            out = zcode_cipher_encrypt(val, cred_path=cred_path)
+        elif op == "decrypt":
+            out = zcode_cipher_decrypt(val, cred_path=cred_path)
+        else:
+            raise _cred_invalid()
+        return {"requestId": req_id, "result": {"ok": True, "value": out}}
+    except _CredentialError as e:
+        return {"requestId": req_id,
+                "result": {"ok": False, "error": {"code": e.code, "message": e.message}}}
+    except Exception as e:
+        return {"requestId": req_id,
+                "result": {"ok": False,
+                           "error": {"code": "CREDENTIAL_SECURE_STORAGE_UNAVAILABLE",
+                                     "message": str(e)}}}
+
+
+_JWT_RE = re.compile(rb'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+
+
+def _local_storage_credential(name):
+    """Fallback reader for ZCode renderer Local Storage when OS keyring is unavailable."""
+    pattern = re.compile(re.escape(name.encode()) + rb'[^\x00]{0,2000}?(' + _JWT_RE.pattern + rb')', re.S)
+    roots = [
+        os.path.expanduser('~/Library/Application Support/ZCode'),
+        os.path.expanduser('~/Library/Application Support/ZCode/session'),
+    ]
+    files = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, names in os.walk(root):
+            if not dirpath.endswith(os.path.join('Local Storage', 'leveldb')):
+                continue
+            for filename in names:
+                if filename.endswith(('.log', '.ldb', '.sst')):
+                    files.append(os.path.join(dirpath, filename))
+    for path in sorted(set(files), key=lambda p: os.path.getmtime(p), reverse=True):
+        try:
+            if os.path.getsize(path) > 32 * 1024 * 1024:
+                continue
+            data = open(path, 'rb').read()
+        except Exception:
+            continue
+        matches = list(pattern.finditer(data))
+        if matches:
+            return matches[-1].group(1).decode()
+    return None
+
+
+def zcode_credential(name):
+    """读取 ~/.zcode/v2/credentials.json 凭据（支持 enc:v2:os / enc:v2:env / enc:v1）。"""
+    try:
+        path = _zcode_credentials_path()
+        with open(path, encoding="utf-8") as f:
             raw = json.load(f)
         value = raw.get(name)
         if not value:
             return None
-        if not value.startswith("enc:v1:"):
-            return value
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        iv, tag, data = [_b64url(x) for x in value[6:].split(".")]
-        secret = os.environ.get("ZCODE_CREDENTIAL_SECRET") or (
-            f"zcode-credential-fallback:{sys.platform}:{os.path.expanduser('~')}:"
-            f"{os.environ.get('USER') or 'unknown'}")
-        key = hashlib.sha256(secret.encode()).digest()
-        return AESGCM(key).decrypt(iv, data + tag, None).decode()
+        if value.startswith("enc:v2:"):
+            try:
+                return zcode_cipher_decrypt(value, cred_path=path)
+            except _CredentialError as e:
+                plain = _local_storage_credential(name)
+                if plain:
+                    return plain
+                log(f"credential {name}: v2 decrypt unavailable ({e.code})")
+                return None
+        return zcode_cipher_decrypt(value, cred_path=path)
     except Exception as e:
         log(f"credential {name} 读取失败: {e}")
         return None
@@ -274,21 +589,33 @@ def _builtin_zhipu_rules():
 
 def config_provider_id_for(account_pid, rules):
     """account:* → config.json 里的 legacy builtin:* 拼写（权益源都用后者）。"""
-    rule = next((r for r in rules if r.get("providerId") == account_pid), None)
+    rule = next((r for r in (rules or ()) if r.get("providerId") == account_pid), None)
     access = ((rule.get("config") or {}).get("access") or {}) if rule else {}
     family, mode = access.get("accountType"), access.get("mode")
     if family and mode:
         plan = "coding-plan" if mode == "individual-coding-plan" else mode
         return f"builtin:{family}-{plan}"
-    m = re.match(r"^account:([a-z0-9]+)-(start-plan|(?:individual-|team-)?coding-plan)$",
-                 account_pid or "")
+    m = re.match(
+        r"^account:([a-z0-9]+)-(start-plan|individual-coding-plan|team-coding-plan"
+        r"|coding-plan|offpeak-idle-plan|off-peak|highspeed-card|highspeed)$",
+        account_pid or "",
+    )
     if m:
-        return f"builtin:{m.group(1)}-" + (
-            "start-plan" if m.group(2) == "start-plan" else "coding-plan")
+        fam, suffix = m.group(1), m.group(2)
+        if suffix in ("individual-coding-plan", "coding-plan"):
+            plan = "coding-plan"
+        elif suffix == "offpeak-idle-plan":
+            plan = "off-peak"
+        elif suffix == "highspeed-card":
+            plan = "highspeed"
+        else:
+            plan = suffix
+        return f"builtin:{fam}-{plan}"
     return account_pid
 
 
 _LIVE_ENTITLED_LAST = None   # 最近一次现场校验成功的权益集合（进程内，离线兜底用）
+_LIVE_TEAM_CONTEXT = {}      # family -> {"organizationId", "projectId", "productId"}
 
 
 _CRED_WATCH = [
@@ -310,8 +637,36 @@ def _cred_fingerprint():
     return tuple(fp)
 
 
+def adapter_version():
+    """适配器自身版本 —— initialize 的 `agentInfo.version` 就是它。
+
+    紧挨着本文件的 pyproject.toml 优先：源码直跑（bin/zcode-acp 的固定跑法，
+    也可能是 `pip install -e` 的开发装）时它描述的就是正在跑的这份代码；装成
+    wheel 的 site-packages 里没有这个文件，才回落到包元数据（dist-info）。两处
+    都拿不到才回 "unknown"：客户端（如 codeg）只把它当展示/诊断字段用，不该
+    因为一个版本字符串缺失就挡住握手。"""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "pyproject.toml"), encoding="utf-8") as f:
+            m = re.search(r'(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"',
+                          f.read())
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version as _dist_version
+        return _dist_version("zcode-acp")
+    except Exception:
+        pass
+    return "unknown"
+
+
 def zcode_app_version():
     """ZCode.app 的 CFBundleShortVersionString（业务请求的 app_version 要带）。"""
+    override = (os.environ.get("ZCODE_APP_VERSION") or "").strip()
+    if override:
+        return override
     try:
         import plistlib
         app = os.path.dirname(os.path.dirname(os.path.dirname(ZC_CJS)))
@@ -324,6 +679,27 @@ def zcode_app_version():
     return "0.0.0"
 
 
+def _read_zcode_settings():
+    try:
+        with open(os.path.join(_zcode_v2_dir(), "setting.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def zcode_client_language():
+    env_lang = (os.environ.get("ZCODE_CLIENT_LANGUAGE") or "").strip()
+    if env_lang:
+        return env_lang
+    st = _read_zcode_settings()
+    for k in ("uiLocale", "locale", "localePreference"):
+        v = str(st.get(k) or "").strip()
+        if v and v != "system":
+            return v
+    return "zh-CN"
+
+
 def _desktop_http_headers():
     """桌面宿主业务请求的公共头（out/host 的 buildZCodeSourceHeadersFromContext）。
 
@@ -332,7 +708,7 @@ def _desktop_http_headers():
     的 deviceMid，桌面自己也是从这里取的）。"""
     mid = ""
     try:
-        with open(os.path.expanduser("~/.zcode/v2/telemetry-state.json")) as f:
+        with open(os.path.join(_zcode_v2_dir(), "telemetry-state.json"), encoding="utf-8") as f:
             mid = str((json.load(f) or {}).get("deviceMid") or "")
     except Exception:
         pass
@@ -341,53 +717,122 @@ def _desktop_http_headers():
         machine = os.uname().machine.lower()
     except Exception:
         pass
+    if machine == "aarch64":
+        machine = "arm64"
+    elif machine == "x86_64":
+        machine = "x64"
+    plat_prefix = "darwin" if sys.platform == "darwin" else (
+        "win32" if sys.platform == "win32" else "linux")
+    os_cat = "macos" if sys.platform == "darwin" else (
+        "windows" if sys.platform == "win32" else "linux")
     ver = zcode_app_version()
     headers = {
         "User-Agent": f"ZCode/{ver}",
         "HTTP-Referer": "https://zcode.z.ai",
         "X-Title": "Z Code@electron",
         "X-ZCode-App-Version": ver,
-        "X-Client-Language": "zh-CN",
-        "X-Os-Category": "macos",
+        "X-Client-Language": zcode_client_language(),
+        "X-Os-Category": os_cat,
     }
     if machine:
-        headers["X-Platform"] = f"darwin-{machine}"
+        headers["X-Platform"] = f"{plat_prefix}-{machine}"
     if mid:
         headers["X-Device-Mid"] = mid
     return headers
 
 
-def live_start_plan_active(family):
-    """现场校验某家族的 Start Plan 是否在期（桌面 billing/balance 同款）。
+def _family_host(family):
+    if family == "zai":
+        raw = os.environ.get("ZAI_BUSINESS_BASE_URL") or "https://api.z.ai"
+    else:
+        raw = os.environ.get("BIGMODEL_API_BASE_URL") or "https://bigmodel.cn"
+    p = urllib.parse.urlparse(raw.strip())
+    if p.scheme and p.netloc:
+        return f"{p.scheme}://{p.netloc}"
+    return raw.rstrip("/")
 
-    桌面 out/host 的 validateStartPlanAvailability：
-      GET {zcode.z.ai}/api/v1/zcode-plan/billing/balance?app_version=…，
-      Bearer = zcodejwttoken（本机 active_provider=bigmodel）或渠道自身 apiKey
-      （legacy config.json 的 builtin:{family}-start-plan.options.apiKey）；
-      data.plans 里存在 status=active 且 plan_id/name 含 "start-plan" 的记录
-      → 在期（桌面 hasActiveStartPlan 判据一致）。
-    返回 True/False；无 token / 网络失败返回 None（不表态，调用方按未确认
-    处理——桌面 unknown 同样不展示）。"""
-    token = zcode_credential("zcodejwttoken")
-    if not token:
+
+def _load_oauth_material(family):
+    """读取家族 OAuth 登录态（对齐桌面 loadOAuthAccountMaterial + stale JWT 拦截）。"""
+    if family not in ("bigmodel", "zai"):
+        return None
+    raw_tok = (zcode_credential(f"oauth:{family}:access_token") or "").strip()
+    if not raw_tok:
+        return None
+    clean_tok = re.sub(r"^Bearer\s+", "", raw_tok, flags=re.I).strip()
+    if not clean_tok:
+        return None
+    zcode_jwt = (zcode_credential("zcodejwttoken") or "").strip()
+    if family == "bigmodel" and zcode_jwt and clean_tok == zcode_jwt:
+        log("bigmodel access token matches stale zcodejwttoken; ignoring")
+        return None
+    uid = ""
+    info_raw = zcode_credential(f"oauth:{family}:user_info")
+    if info_raw:
         try:
-            with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
-                v2 = json.load(f)
-            token = (((v2.get("provider") or {}).get(
-                f"builtin:{family}-start-plan") or {}).get("options")
-                or {}).get("apiKey") or ""
+            prof = json.loads(info_raw) or {}
+            if isinstance(prof, dict):
+                uid = str(prof.get("id") or prof.get("user_id") or "").strip()
         except Exception:
-            token = ""
+            uid = ""
+    zcode_uid = ""
+    zuser_raw = zcode_credential("zcode_user_info") or zcode_credential("oauth:zcode:user_info")
+    if zuser_raw:
+        try:
+            zprof = json.loads(zuser_raw) or {}
+            if isinstance(zprof, dict):
+                zcode_uid = str(zprof.get("id") or zprof.get("user_id") or "").strip()
+        except Exception:
+            zcode_uid = ""
+    sess_rev = (zcode_credential("oauth:session_revision") or "").strip() or None
+    active_prov = (zcode_credential("oauth:active_provider") or "").strip() or None
+    return {
+        "family": family,
+        "accessToken": clean_tok,
+        "accountIdentity": uid or None,
+        "zcodeJwtToken": zcode_jwt or None,
+        "sessionRevision": sess_rev,
+        "zcodeUserId": zcode_uid or None,
+        "activeProvider": active_prov,
+    }
+
+
+def _start_plan_token_for_family(family):
+    """对齐桌面 resolveStartPlanAuthorization / Hne：按 active_provider 隔离家族。"""
+    active = (zcode_credential("oauth:active_provider") or "").strip()
+    jwt = (zcode_credential("zcodejwttoken") or "").strip()
+    if family == "bigmodel":
+        if active == "bigmodel" and jwt:
+            return jwt
+    elif family == "zai":
+        if active in ("zai", "zai_cn", "") and jwt:
+            return jwt
+    try:
+        with open(os.path.join(_zcode_v2_dir(), "config.json"), encoding="utf-8") as f:
+            v2 = json.load(f)
+        tok = (((v2.get("provider") or {}).get(f"builtin:{family}-start-plan") or {})
+               .get("options") or {}).get("apiKey") or ""
+        return str(tok).strip()
+    except Exception:
+        return ""
+
+
+def live_start_plan_active(family):
+    """现场校验某家族的 Start Plan 是否在期（桌面 billing/balance 同款）。"""
+    token = _start_plan_token_for_family(family)
     if not token:
+        return None
+    clean = re.sub(r"^Bearer\s+", "", token, flags=re.I).strip()
+    if not clean:
         return None
     url = (os.environ.get("ZCODE_PLAN_BALANCE_URL")
            or "https://zcode.z.ai/api/v1/zcode-plan/billing/balance")
     url += ("&" if "?" in url else "?") + "app_version=" + zcode_app_version()
     try:
         headers = _desktop_http_headers()
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = f"Bearer {clean}"
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
-                                    timeout=5) as resp:
+                                    timeout=5, context=_http_ssl_context()) as resp:
             env = json.load(resp)
     except Exception as e:
         log(f"start plan live check ({family}) failed: {e}")
@@ -397,10 +842,16 @@ def live_start_plan_active(family):
     if env.get("success") is False or (
             isinstance(env.get("code"), int) and env["code"] not in (0, 200)):
         return False
-    for p in ((env.get("data") or {}).get("plans") or []):
+    data = _d(env.get("data"))
+    srv_t = data.get("server_time")
+    now_s = float(srv_t) if isinstance(srv_t, (int, float)) and srv_t >= 0 else time.time()
+    for p in (data.get("plans") or []):
         if not isinstance(p, dict):
             continue
         if str(p.get("status") or "").strip().lower() != "active":
+            continue
+        ends_at = p.get("ends_at")
+        if isinstance(ends_at, (int, float)) and 0 < float(ends_at) <= now_s:
             continue
         pid = str(p.get("plan_id") or "").strip().lower()
         name = str(p.get("name") or "").strip().lower()
@@ -412,45 +863,137 @@ def live_start_plan_active(family):
     return False
 
 
-_LIVE_ENTITLED_LAST = None   # 最近一次现场校验成功的权益集合（进程内，离线兜底用）
+def _is_biz_ok(payload):
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is False:
+        return False
+    code = payload.get("code")
+    if isinstance(code, int) and code not in (0, 200):
+        return False
+    if isinstance(code, str) and code not in ("0", "200"):
+        return False
+    return True
+
+
+def _check_team_coding_plan(family, token, host, selected_team=None):
+    """校验 Team Coding Plan 权益（对齐桌面 IUe + cR querySubscribeDetail）。"""
+    try:
+        req = urllib.request.Request(
+            f"{host}/api/biz/customer/getCustomerInfo",
+            headers={"Authorization": token, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5, context=_http_ssl_context()) as resp:
+            cust = json.load(resp)
+    except Exception as e:
+        log(f"team customer info ({family}) failed: {e}")
+        return None, None
+    if not _is_biz_ok(cust):
+        return None, None
+    orgs = _d(cust.get("data")).get("organizations")
+    if not isinstance(orgs, list):
+        return None, None
+    candidates = []
+    if isinstance(selected_team, dict) and selected_team.get("projectId"):
+        sel_org = str(selected_team.get("organizationId") or "").strip()
+        sel_proj = str(selected_team.get("projectId") or "").strip()
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            oid = str(org.get("organizationId") or "").strip()
+            if sel_org and oid != sel_org:
+                continue
+            for proj in (org.get("projects") or []):
+                if not isinstance(proj, dict):
+                    continue
+                pid = str(proj.get("projectId") or "").strip()
+                ptype = str(proj.get("projectType") or "").strip()
+                if pid == sel_proj and ptype == "2" and oid:
+                    candidates.append((oid, pid))
+        if not candidates:
+            return False, None
+    else:
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            oid = str(org.get("organizationId") or "").strip()
+            if not oid:
+                continue
+            for proj in (org.get("projects") or []):
+                if not isinstance(proj, dict):
+                    continue
+                pid = str(proj.get("projectId") or "").strip()
+                ptype = str(proj.get("projectType") or "").strip()
+                if pid and ptype == "2":
+                    candidates.append((oid, pid))
+        if not candidates:
+            return False, None
+    auth_hdr = f"Bearer {token}" if family == "zai" else token
+    got_resp = False
+    for oid, pid in candidates[:3]:
+        try:
+            qreq = urllib.request.Request(
+                f"{host}/api/biz/team/subscribe/product/querySubscribeDetail",
+                headers={
+                    "Authorization": auth_hdr,
+                    "Content-Type": "application/json",
+                    "bigmodel-organization": oid,
+                    "bigmodel-project": pid,
+                },
+            )
+            with urllib.request.urlopen(qreq, timeout=5, context=_http_ssl_context()) as resp:
+                sub_env = json.load(resp)
+        except Exception as e:
+            log(f"team subscribe detail ({family}) failed: {e}")
+            continue
+        if not _is_biz_ok(sub_env):
+            continue
+        got_resp = True
+        sub = _d(sub_env.get("data"))
+        if (sub.get("hasSubscription") is True
+                and sub.get("status") == "EFFECTIVE"
+                and sub.get("memberGrantStatus") == "VALID"):
+            return True, {
+                "organizationId": oid,
+                "projectId": pid,
+                "productId": sub.get("productId"),
+            }
+    return (False if got_resp else None), None
+
 
 def live_entitled_plans():
-    """现场校验订阅权益（与桌面 host 的 resolveFamilyAvailability 同判据）。
-
-    对每个"已连接"的家族（credentials.json 里有该家族的 oauth 凭据）：
-      1) 个人 Coding Plan：GET {family_host}/api/biz/subscription/list，
-         productId/Name 含 "coding" 且 status=VALID、inCurrentPeriod=true
-         → builtin:{family}-coding-plan（= 桌面 isActivePersonalCodingPlan）。
-      2) Start Plan：见 live_start_plan_active → builtin:{family}-start-plan。
-    家族未连接 → 不产出任何权益（桌面把整族标 coding_plan_not_connected）。
-    返回 legacy 权益键集合；现场全挂（无凭据/断网）时返回**进程内最近一次
-    成功值**，首次即全挂返回 None（调用方回落本地信号）。"""
+    """现场校验订阅权益（对齐桌面 resolveFamilyAvailability：个人 + 团队 + Start Plan）。"""
     global _LIVE_ENTITLED_LAST
+    settings = _read_zcode_settings()
+    selections = _d(settings.get("providerFamilyConnectionSelections"))
     targets = []
-    for family, token_name, env_name, default_host in (
-        ("bigmodel", "oauth:bigmodel:access_token", "BIGMODEL_API_BASE_URL", "https://bigmodel.cn"),
-        ("zai", "oauth:zai:access_token", "ZAI_BUSINESS_BASE_URL", "https://api.z.ai"),
-    ):
-        token = zcode_credential(token_name)   # 每次现读（账号可能已切换）
-        if token:
-            targets.append((family, token,
-                            (os.environ.get(env_name) or default_host).rstrip("/")))
+    for family in ("bigmodel", "zai"):
+        mat = _load_oauth_material(family)
+        if mat and mat.get("accessToken"):
+            targets.append((family, mat["accessToken"], _family_host(family)))
     if not targets:
-        # 无任何登录凭据：没有账号身份 → 不产出任何权益（桌面整族
-        # coding_plan_not_connected）。返回空集合而非 None——避免调用方
-        # 回落到可能过期的本地缓存把已退场的渠道顶回目录。
+        for family in ("bigmodel", "zai"):
+            st = live_start_plan_active(family)
+            if st:
+                return {f"builtin:{family}-start-plan"}
         return set()
-    results, start_active = {}, {}
+    results, team_results, start_active = {}, {}, {}
 
     def check(family, token, host):
         try:
             req = urllib.request.Request(
                 host + "/api/biz/subscription/list",
                 headers={"Authorization": token, "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5, context=_http_ssl_context()) as resp:
                 results[family] = json.load(resp)
         except Exception as e:
             log(f"entitlement live check ({family}) failed: {e}")
+        sel = _d(selections.get(family))
+        sel_team = sel if sel.get("kind") == "team-coding-plan" else None
+        try:
+            team_results[family] = _check_team_coding_plan(family, token, host, sel_team)
+        except Exception as e:
+            log(f"team entitlement live check ({family}) failed: {e}")
         try:
             start_active[family] = live_start_plan_active(family)
         except Exception as e:
@@ -459,62 +1002,55 @@ def live_entitled_plans():
     threads = [threading.Thread(target=check, args=t, daemon=True) for t in targets]
     for th in threads:
         th.start()
-    deadline = time.time() + 6
+    deadline = time.time() + 6.5
     for th in threads:
         th.join(max(0.1, deadline - time.time()))
 
     out, got_any = set(), False
     for family, _token, _host in targets:
         payload = results.get(family)
-        if isinstance(payload, dict):
-            if not (payload.get("success") is False or (
-                    isinstance(payload.get("code"), int)
-                    and payload["code"] not in (0, 200))):
+        if _is_biz_ok(payload):
+            got_any = True
+            for item in payload.get("data") or []:
+                if not isinstance(item, dict):
+                    continue
+                label = f"{item.get('productId') or ''} " \
+                        f"{item.get('productName') or ''}".lower()
+                if "coding" not in label:
+                    continue
+                if item.get("status") == "VALID" \
+                        and item.get("inCurrentPeriod") is True:
+                    out.add(f"builtin:{family}-coding-plan")
+        t_res = team_results.get(family)
+        if t_res is not None:
+            t_ok, t_ctx = t_res
+            if t_ok is not None:
                 got_any = True
-                for item in payload.get("data") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    label = f"{item.get('productId') or ''} " \
-                            f"{item.get('productName') or ''}".lower()
-                    if "coding" not in label:
-                        continue
-                    if item.get("status") == "VALID" \
-                            and item.get("inCurrentPeriod") is True:
-                        out.add(f"builtin:{family}-coding-plan")
+            if t_ok and t_ctx:
+                _LIVE_TEAM_CONTEXT[family] = t_ctx
+                out.add(f"builtin:{family}-team-coding-plan")
+            elif t_ok is False:
+                _LIVE_TEAM_CONTEXT.pop(family, None)
         st = start_active.get(family)
         if st is not None:
             got_any = True
             if st:
                 out.add(f"builtin:{family}-start-plan")
     if not got_any:
-        log("entitlement live check: 全部失败，沿用最近一次成功值"
-            if _LIVE_ENTITLED_LAST is not None else
-            "entitlement live check: 全部失败（无历史值）")
-        return _LIVE_ENTITLED_LAST
+        log("entitlement live check: 全部失败；不展示订阅渠道")
+        return None
     _LIVE_ENTITLED_LAST = set(out)
     log(f"entitlement live check: {sorted(out) or '(none)'}")
     return out
 
 
 def entitled_builtin_providers(live=None):
-    """用户实际持有的订阅（权益键 = legacy builtin:<family>-<plan>）。
-
-    与桌面 host 的 resolveFamilyAccountProviders/mQ 对齐：
-      1) **现场校验为准**（live，见 live_entitled_plans）：某家族一旦有现场
-         结论，未确认的 plan 一律不展示（桌面 unavailable/unknown ⇒
-         entitled=false）。2026-10-14 报障：coding-plan-cache.json 里 9 天前
-         就退场的 zai-start-plan 被无条件并进来，一直顶在 Codeg 目录里。
-      2) 桌面里显式启用且填了 key 的 apiKey 渠道（config.json builtin:*
-         enabled+apiKey）是直连渠道，与订阅校验无关，始终保留。
-      3) 只有**现场校验整体不可用**（离线）时才退回本地信号
-         （coding-plan-cache / setting.json 选择记录）。
-    `live` 为调用方预取的现场结果（集合或 None）——同一次 session/new 内只查
-    一次网络；不传则现查。"""
+    """用户实际持有的订阅（权益键 = legacy builtin:<family>-<plan>）。"""
     if live is None:
         live = live_entitled_plans()
     out = set(live or ())
     try:
-        with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
+        with open(os.path.join(_zcode_v2_dir(), "config.json"), encoding="utf-8") as f:
             v2 = json.load(f)
         for pid, pc in (v2.get("provider") or {}).items():
             if pid.startswith("builtin:") and (pc or {}).get("enabled") is True \
@@ -522,122 +1058,700 @@ def entitled_builtin_providers(live=None):
                 out.add(pid)
     except Exception:
         pass
-    if live is not None:
-        return out
-    # —— 以下仅在现场校验整体不可用时执行（离线兜底）——
-    try:
-        with open(os.path.expanduser("~/.zcode/v2/coding-plan-cache.json")) as f:
-            cache = json.load(f)
-        for pid, entry in ((cache.get("entryStatus") or {}).get("items") or {}).items():
-            if (entry or {}).get("status") == "available":
-                out.add(pid)
-    except Exception:
-        pass
-    if not out:
-        try:
-            with open(os.path.expanduser("~/.zcode/v2/setting.json")) as f:
-                setting = json.load(f)
-            for selected in (setting.get("modelProviderFamilySelectedKeys") or {}).values():
-                m = re.search(r"(builtin:[a-z0-9-]+)", str(selected))
-                if m:
-                    out.add(m.group(1))
-        except Exception:
-            pass
     return out
 
 
-_CRED_WATCH = [
-    "~/.zcode/v2/credentials.json",       # 登录/账号切换
-    "~/.zcode/v2/config.json",
-    "~/.zcode/v2/setting.json",           # 家族选择
-    "~/.zcode/v2/coding-plan-cache.json",
-]
+def _is_account_coding_plan(provider_id, rules=None):
+    if not provider_id or not str(provider_id).startswith("account:"):
+        return False
+    _, mode = _resolve_account_plan_mode(provider_id, rules or ())
+    return mode in ("individual-coding-plan", "team-coding-plan")
 
 
-def build_account_provider_payload(live_entitled=None):
-    """provider/updateAccountConfig 载荷（桌面宿主同款形状，schema 实测）。"""
+def build_account_provider_payload(live_entitled=None, current_account_pid=None):
+    """provider/updateAccountConfig 载荷（对齐 ZCode 3.18.2 $Ci / Dun / Win 单 current 不变量）。"""
     path, zhipu, table = _builtin_zhipu_rules()
     if not path or not zhipu or table is None:
         return None
     revision = f"zcode-builtin:{table.get('revision') or 0}:" + hashlib.sha256(
         os.path.abspath(path).encode()).hexdigest()
     entitled = entitled_builtin_providers(live_entitled)
+    settings = _read_zcode_settings()
+    active_domain = str(settings.get("providerFamilyDomain") or "").strip()
+    selections = _d(settings.get("providerFamilyConnectionSelections"))
     providers, states = {}, {}
+    parsed_rules = []
+    entitled_plans = []
     for rule in zhipu:
         pid = rule.get("providerId") or ""
         if not pid:
             continue
         cfg = rule.get("config") or {}
-        is_entitled = config_provider_id_for(pid, zhipu) in entitled
+        access = _d(cfg.get("access"))
+        fam = access.get("accountType") or ""
+        mode = access.get("mode") or ""
+        derived = mode in ("off-peak", "highspeed")
+        is_entitled = (not derived) and (config_provider_id_for(pid, zhipu) in entitled)
         entry = {"access": {"type": "zhipu-account", "entitled": is_entitled}}
         if cfg.get("builtinModelIds"):
             entry["builtinModelIds"] = cfg["builtinModelIds"]
         providers[pid] = entry
-        states[pid] = {"availability": "available" if is_entitled else "unavailable",
-                       "entitled": is_entitled, "current": is_entitled}
+        parsed_rules.append((pid, fam, mode, derived, is_entitled))
+        if is_entitled and mode in ("individual-coding-plan", "team-coding-plan"):
+            entitled_plans.append((pid, fam, mode))
+
+    # Win(e) 严格要求 account-plan（individual/team coding-plan）中 current===True 恰好 1 个
+    chosen_plan_pid = None
+    if entitled_plans:
+        ep_pids = {p for p, _, _ in entitled_plans}
+        if current_account_pid and current_account_pid in ep_pids:
+            chosen_plan_pid = current_account_pid
+        if chosen_plan_pid is None and active_domain:
+            sel_kind = str(_d(selections.get(active_domain)).get("kind") or "").strip()
+            if sel_kind:
+                for p, f, m in entitled_plans:
+                    if f == active_domain and m == sel_kind:
+                        chosen_plan_pid = p
+                        break
+        if chosen_plan_pid is None and active_domain:
+            for p, f, _ in entitled_plans:
+                if f == active_domain:
+                    chosen_plan_pid = p
+                    break
+        if chosen_plan_pid is None:
+            chosen_plan_pid = entitled_plans[0][0]
+
+    for pid, fam, mode, derived, is_entitled in parsed_rules:
+        if derived or not is_entitled:
+            is_current = False
+        elif mode in ("individual-coding-plan", "team-coding-plan"):
+            is_current = (pid == chosen_plan_pid)
+        else:
+            # start-plan 在 IFr 中属 "ordinary"，不受 account-plan 单 current 约束
+            is_current = bool(not active_domain or fam == active_domain)
+        states[pid] = {
+            "availability": "available" if is_entitled else "unavailable",
+            "entitled": is_entitled,
+            "current": bool(is_current),
+        }
     return {"revision": f"account:zcode-acp:{int(time.time() * 1000)}",
             "basedOnZCodeBuiltinRevision": revision,
             "providers": providers, "states": states}
 
 
-def coding_plan_request_auth(provider_id):
-    """account:* 模型请求的运行时鉴权（interaction/requestProviderRuntimeHeaders）。
+_PROJECT_LOCATION_CACHE = {}   # (origin, family, account_id, team_key) -> dict
+_PAT_CACHE = {}                # scope_tuple -> {"token", "fingerprint", "expiresAt", "refreshAt"}
+_PAT_LOCK = threading.Lock()
 
-    来源优先级（与桌面 requestAuth 行为对齐）：
-    1) 凭据存储里"当前登录账号"的账户 key —— 形如
-       `account-provider:coding-plan:<accountProviderId>:account:<uid>:api-key`
-       （桌面开通订阅时写入；本机 config.json 的旧 key 属于另一个账号，
-        用它打订阅端点会 1113"余额不足或无可用资源包"）；
-    2) legacy config.json 的 plan key（无凭据存储时兜底）；
-    3) ZCode 业务 JWT（zcodejwttoken，加密存储可解密）——start-plan 实测可用。"""
-    if not provider_id or not provider_id.startswith("account:"):
+
+def clear_project_token_caches():
+    with _PAT_LOCK:
+        _PROJECT_LOCATION_CACHE.clear()
+        _PAT_CACHE.clear()
+
+
+def _token_sha256(token):
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _parse_signing_credential(token):
+    """对齐 zcode.cjs KLr：仅接受 project_access 签名 JWT 或两段式 <id>.<secret>。
+
+    返回 (kind, api_key_id)；不合法（例如 zcodejwttoken）返回 (None, None)。"""
+    if not isinstance(token, str):
+        return None, None
+    tok = token.strip()
+    if not tok:
+        return None, None
+    parts = tok.split(".")
+    if len(parts) == 3 and parts[2]:
+        try:
+            hdr = json.loads(_b64url(parts[0]).decode("utf-8"))
+            pl = json.loads(_b64url(parts[1]).decode("utf-8"))
+        except Exception:
+            return None, None
+        if not isinstance(hdr, dict) or not isinstance(pl, dict):
+            return None, None
+        if hdr.get("sign_type") != "SIGN" or pl.get("token_use") != "project_access":
+            return None, None
+        key_id = str(pl.get("api_key") or "").strip()
+        if not key_id:
+            return None, None
+        exp = pl.get("exp")
+        if isinstance(exp, (int, float)) and float(exp) <= time.time() + 5:
+            return None, None
+        return "project_access", key_id
+    if len(parts) == 2 and parts[0] and parts[1]:
+        if re.search(r"[\s:]", parts[0]) or re.search(r"[\s:]", parts[1]):
+            return None, None
+        return "api_key", parts[0]
+    return None, None
+
+
+def _resolve_account_plan_mode(provider_id, rules, account_access=None):
+    acc = _d(account_access)
+    fam = str(acc.get("accountType") or "").strip()
+    mode = str(acc.get("mode") or "").strip()
+    if not (fam and mode):
+        rule = next((r for r in (rules or ()) if r.get("providerId") == provider_id), None)
+        r_acc = _d(_d(rule).get("config")).get("access") if rule else None
+        r_acc = _d(r_acc)
+        fam = fam or str(r_acc.get("accountType") or "").strip()
+        mode = mode or str(r_acc.get("mode") or "").strip()
+    if not fam:
+        if str(provider_id).startswith("account:bigmodel"):
+            fam = "bigmodel"
+        elif str(provider_id).startswith("account:zai"):
+            fam = "zai"
+    if not mode:
+        if str(provider_id).endswith("-start-plan"):
+            mode = "start-plan"
+        elif str(provider_id).endswith("-team-coding-plan"):
+            mode = "team-coding-plan"
+        elif "offpeak" in str(provider_id) or str(provider_id).endswith("-off-peak"):
+            mode = "off-peak"
+        elif "highspeed" in str(provider_id):
+            mode = "highspeed"
+        elif "coding-plan" in str(provider_id):
+            mode = "individual-coding-plan"
+    return fam, mode
+
+
+def _resolve_team_context_for_family(family, login_token=None):
+    settings = _read_zcode_settings()
+    sel = _d(_d(settings.get("providerFamilyConnectionSelections")).get(family))
+    if sel.get("kind") == "team-coding-plan":
+        oid = str(sel.get("organizationId") or "").strip()
+        pid = str(sel.get("projectId") or "").strip()
+        if oid and pid:
+            return {
+                "organizationId": oid,
+                "projectId": pid,
+                "productId": sel.get("productId"),
+            }
+    cached = _LIVE_TEAM_CONTEXT.get(family)
+    if isinstance(cached, dict) and cached.get("organizationId") and cached.get("projectId"):
+        return dict(cached)
+    if login_token:
+        ok, ctx = _check_team_coding_plan(family, login_token, _family_host(family), None)
+        if ok and ctx:
+            _LIVE_TEAM_CONTEXT[family] = dict(ctx)
+            return dict(ctx)
+    return None
+
+
+def _compute_account_scope(family, mode, team_ctx, mat):
+    team_part = (
+        [team_ctx.get("organizationId"), team_ctx.get("projectId"), team_ctx.get("productId")]
+        if mode == "team-coding-plan" and isinstance(team_ctx, dict) else None
+    )
+    payload = [
+        family,
+        mode,
+        team_part,
+        mat.get("accessToken"),
+        mat.get("zcodeJwtToken"),
+        mat.get("sessionRevision"),
+        mat.get("accountIdentity"),
+        mat.get("zcodeUserId"),
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _team_cache_key(team_ctx):
+    if not isinstance(team_ctx, dict):
         return None
+    return (str(team_ctx.get("organizationId") or "").strip(),
+            str(team_ctx.get("projectId") or "").strip())
+
+
+def _load_cached_project_location(origin, family, account_id, team_ctx, allow_disk=True):
+    tkey = _team_cache_key(team_ctx)
+    mem_key = (origin, family, account_id, tkey)
+    with _PAT_LOCK:
+        hit = _PROJECT_LOCATION_CACHE.get(mem_key)
+    if isinstance(hit, dict) and hit.get("organizationId") and hit.get("projectId") and hit.get("apiKeyId"):
+        return dict(hit)
+    if not allow_disk:
+        return None
+    try:
+        with open(_zcode_credentials_path(), encoding="utf-8") as f:
+            creds = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(creds, dict):
+        return None
+    prefix = "project-key-location:v1:"
+    for k in creds:
+        if not isinstance(k, str) or not k.startswith(prefix):
+            continue
+        try:
+            spec = json.loads(urllib.parse.unquote(k[len(prefix):]))
+        except Exception:
+            continue
+        if not isinstance(spec, list) or len(spec) < 6:
+            continue
+        s_origin, s_fam, s_acct, s_team, s_scene, s_sel = spec[:6]
+        if s_origin != origin or s_fam != family or s_acct != account_id or s_scene != 1:
+            continue
+        if tkey is not None:
+            if not isinstance(s_team, dict):
+                continue
+            if (str(s_team.get("organizationId") or "").strip(),
+                    str(s_team.get("projectId") or "").strip()) != tkey:
+                continue
+        else:
+            if s_team is not None or s_sel not in ("non-team", "default"):
+                continue
+        dec = zcode_credential(k)
+        if not dec:
+            continue
+        try:
+            loc = json.loads(dec)
+        except Exception:
+            continue
+        if not isinstance(loc, dict):
+            continue
+        oid = str(loc.get("organizationId") or "").strip()
+        pid = str(loc.get("projectId") or "").strip()
+        kid = str(loc.get("apiKeyId") or "").strip()
+        if not (oid and pid and kid):
+            continue
+        if tkey is not None and (oid, pid) != tkey:
+            continue
+        out = {"organizationId": oid, "projectId": pid, "apiKeyId": kid}
+        with _PAT_LOCK:
+            _PROJECT_LOCATION_CACHE[mem_key] = dict(out)
+        return out
+    return None
+
+
+def _http_ssl_context():
+    for env_key in ("SSL_CERT_FILE", "ZCODE_AGENT_CA_CERT_FILE", "NODE_EXTRA_CA_CERTS"):
+        ca = (os.environ.get(env_key) or "").strip()
+        if ca and os.path.isfile(ca):
+            import ssl as _ssl
+            return _ssl.create_default_context(cafile=ca)
+    return None
+
+
+def _http_json(url, method="GET", headers=None, body_obj=None, timeout=10):
+    data = None
+    if body_obj is not None:
+        data = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=dict(headers or {}), method=method)
+    ctx = _http_ssl_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode("utf-8", errors="replace"))
+        except Exception:
+            err_body = None
+        return e.code, err_body
+
+
+def _discover_project_location(origin, family, login_token, team_ctx=None):
+    """对齐 zcode.cjs ProjectAccessTokenClient.#n：解析组织/项目并获取/创建专属 API Key ID。"""
+    base_headers = {"Authorization": login_token, "Content-Type": "application/json"}
+    st_code, cust = _http_json(f"{origin}/api/biz/customer/getCustomerInfo",
+                               method="GET", headers=base_headers, timeout=10)
+    if st_code >= 400 or not _is_biz_ok(cust):
+        raise RuntimeError(f"project_token_customer_info_failed:{st_code}")
+    orgs = _d(cust.get("data")).get("organizations")
+    if not isinstance(orgs, list):
+        raise RuntimeError("project_token_invalid_response")
+    if isinstance(team_ctx, dict):
+        t_oid = str(team_ctx.get("organizationId") or "").strip()
+        t_pid = str(team_ctx.get("projectId") or "").strip()
+        matched = False
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            if str(org.get("organizationId") or "").strip() != t_oid:
+                continue
+            for proj in (org.get("projects") or []):
+                if isinstance(proj, dict) and str(proj.get("projectId") or "").strip() == t_pid:
+                    matched = True
+                    break
+        if not matched:
+            raise RuntimeError("project_token_project_unavailable")
+        org_id, proj_id = t_oid, t_pid
+    else:
+        non_team_orgs = []
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            oid = str(org.get("organizationId") or "").strip()
+            if not oid:
+                continue
+            projs = [
+                p for p in (org.get("projects") or [])
+                if isinstance(p, dict)
+                and str(p.get("projectId") or "").strip()
+                and str(p.get("projectType") or "").strip() != "2"
+            ]
+            if projs:
+                non_team_orgs.append((org, projs))
+        if not non_team_orgs:
+            for org in orgs:
+                if not isinstance(org, dict):
+                    continue
+                oid = str(org.get("organizationId") or "").strip()
+                projs = [p for p in (org.get("projects") or [])
+                         if isinstance(p, dict) and str(p.get("projectId") or "").strip()]
+                if oid and projs:
+                    non_team_orgs.append((org, projs))
+        if not non_team_orgs:
+            raise RuntimeError("project_token_project_unavailable")
+        chosen_org, chosen_projs = next(
+            ((o, ps) for o, ps in non_team_orgs if "默认机构" in str(o.get("organizationName") or "")),
+            non_team_orgs[0],
+        )
+        chosen_proj = next(
+            (p for p in chosen_projs if "默认项目" in str(p.get("projectName") or "")),
+            chosen_projs[0],
+        )
+        org_id = str(chosen_org.get("organizationId") or "").strip()
+        proj_id = str(chosen_proj.get("projectId") or "").strip()
+    enc_org = urllib.parse.quote(org_id, safe="")
+    enc_proj = urllib.parse.quote(proj_id, safe="")
+    keys_url = f"{origin}/api/biz/v1/organization/{enc_org}/projects/{enc_proj}/api_keys"
+    key_name = "zcode-team-api-key" if team_ctx else "zcode-api-key"
+    if team_ctx:
+        key_headers = {
+            "Authorization": login_token,
+            "Content-Type": "application/json",
+            "bigmodel-organization": org_id,
+            "bigmodel-project": proj_id,
+        }
+    else:
+        key_headers = {
+            "Authorization": f"Bearer {login_token}" if family == "zai" else login_token,
+            "Content-Type": "application/json",
+        }
+    st_k, k_env = _http_json(keys_url, method="GET", headers=key_headers, timeout=10)
+    if st_k >= 400 or not _is_biz_ok(k_env) or not isinstance(k_env.get("data"), list):
+        raise RuntimeError(f"project_token_list_keys_failed:{st_k}")
+    found = None
+    for item in k_env["data"]:
+        if not isinstance(item, dict) or item.get("name") != key_name:
+            continue
+        api_k = str(item.get("apiKey") or "").strip()
+        if not api_k:
+            continue
+        if team_ctx and item.get("keyType") != 2:
+            continue
+        found = api_k
+        break
+    if not found:
+        create_body = {"name": key_name, "usageScene": 1}
+        if team_ctx:
+            create_body["keyType"] = 2
+        st_c, c_env = _http_json(keys_url, method="POST", headers=key_headers,
+                                 body_obj=create_body, timeout=10)
+        if st_c >= 400 or not _is_biz_ok(c_env):
+            raise RuntimeError(f"project_token_create_key_failed:{st_c}")
+        c_data = _d(c_env.get("data"))
+        api_k = str(c_data.get("apiKey") or "").strip()
+        if not api_k or (team_ctx and (c_data.get("name") != key_name or c_data.get("keyType") != 2)):
+            raise RuntimeError("project_token_invalid_response")
+        found = api_k
+    return {"organizationId": org_id, "projectId": proj_id, "apiKeyId": found}
+
+
+def _mint_project_access_token(origin, family, account_id, login_token,
+                               team_ctx=None, rejected_fp=None):
+    """对齐 zcode.cjs ProjectAccessTokenClient.resolve：签发并缓存短效 ProjectAccessToken。"""
+    tkey = _team_cache_key(team_ctx)
+    mem_loc_key = (origin, family, account_id, tkey)
+    for loc_attempt in range(2):
+        loc = _load_cached_project_location(
+            origin, family, account_id, team_ctx, allow_disk=(loc_attempt == 0))
+        if not loc:
+            loc = _discover_project_location(origin, family, login_token, team_ctx=team_ctx)
+            with _PAT_LOCK:
+                _PROJECT_LOCATION_CACHE[mem_loc_key] = dict(loc)
+        cache_key = (
+            origin, family, account_id,
+            loc["organizationId"], loc["projectId"], loc["apiKeyId"], login_token,
+        )
+        now = time.time()
+        with _PAT_LOCK:
+            cached = _PAT_CACHE.get(cache_key)
+            if cached and rejected_fp and cached.get("fingerprint") == rejected_fp:
+                _PAT_CACHE.pop(cache_key, None)
+                cached = None
+            if cached and now < min(cached["refreshAt"], cached["expiresAt"]):
+                return cached["token"], loc["apiKeyId"]
+        enc_org = urllib.parse.quote(loc["organizationId"], safe="")
+        enc_proj = urllib.parse.quote(loc["projectId"], safe="")
+        enc_key = urllib.parse.quote(loc["apiKeyId"], safe="")
+        mint_url = (
+            f"{origin}/api/biz/v1/organization/{enc_org}/projects/{enc_proj}"
+            f"/api_keys/{enc_key}/access_tokens"
+        )
+        mint_headers = {
+            "Authorization": f"Bearer {login_token}",
+            "Content-Type": "application/json",
+        }
+        mint_body = {"clientType": "zcode", "clientVersion": zcode_app_version()}
+        st_m, m_env = None, None
+        for attempt in range(2):
+            try:
+                st_m, m_env = _http_json(mint_url, method="POST", headers=mint_headers,
+                                         body_obj=mint_body, timeout=10)
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.3)
+                    continue
+                raise
+            if st_m in (429, 500, 502, 503, 504) and attempt == 0:
+                time.sleep(0.3 + random.random() * 0.4)
+                continue
+            break
+        env_code = _d(m_env).get("code")
+        if (st_m == 404 or env_code == 404) and loc_attempt == 0:
+            with _PAT_LOCK:
+                _PROJECT_LOCATION_CACHE.pop(mem_loc_key, None)
+                _PAT_CACHE.pop(cache_key, None)
+            continue
+        if st_m is None or st_m >= 400 or not _is_biz_ok(m_env):
+            raise RuntimeError(f"project_token_http_{st_m}")
+        data = _d(m_env.get("data"))
+        if data.get("enable") is False:
+            with _PAT_LOCK:
+                _PAT_CACHE.pop(cache_key, None)
+            raise RuntimeError("project_token_disabled")
+        pat = str(data.get("accessToken") or "").strip()
+        exp_in = data.get("expiresIn")
+        exp_at = data.get("expiresAt")
+        if not pat or not isinstance(exp_in, (int, float)) or not isinstance(exp_at, (int, float)):
+            raise RuntimeError("project_token_invalid_response")
+        now_done = time.time()
+        expires_at = min(float(exp_at), now_done + float(exp_in))
+        if expires_at <= now_done:
+            raise RuntimeError("project_token_invalid_response")
+        refresh_at = expires_at - 120.0 - random.random() * 60.0
+        fp = _token_sha256(pat)
+        with _PAT_LOCK:
+            _PAT_CACHE[cache_key] = {
+                "token": pat,
+                "fingerprint": fp,
+                "expiresAt": expires_at,
+                "refreshAt": refresh_at,
+            }
+        return pat, loc["apiKeyId"]
+    raise RuntimeError("project_token_request_failed")
+
+
+def _fallback_manual_coding_plan_auth(provider_id, legacy_pid, family):
+    """无 OAuth 会话时的直连 API Key 兜底（仅允许两段式 <id>.<secret> 或有效签名 PAT）。"""
+    uid = ""
+    info = zcode_credential(f"oauth:{family}:user_info") if family else None
+    if info:
+        try:
+            prof = json.loads(info) or {}
+            if isinstance(prof, dict):
+                uid = str(prof.get("id") or prof.get("user_id") or "").strip()
+        except Exception:
+            uid = ""
+    auth_src = (zcode_credential(f"account-provider:coding-plan:{provider_id}:auth-source") or "").strip()
+    if uid and auth_src in ("manual", ""):
+        cand = zcode_credential(
+            f"account-provider:coding-plan:{provider_id}:account:{uid}:api-key")
+        kind, key_id = _parse_signing_credential(cand)
+        if kind and key_id:
+            return {"apiKey": cand.strip(), "apiKeyId": key_id}
+    try:
+        with open(os.path.join(_zcode_v2_dir(), "config.json"), encoding="utf-8") as f:
+            v2 = json.load(f)
+        pc = _d(_d(v2.get("provider")).get(legacy_pid))
+        if pc.get("enabled") is not False:
+            cand = _d(pc.get("options")).get("apiKey")
+            kind, key_id = _parse_signing_credential(cand)
+            if kind and key_id:
+                return {"apiKey": str(cand).strip(), "apiKeyId": key_id}
+    except Exception:
+        pass
+    return None
+
+
+def coding_plan_request_auth(provider_id, params=None):
+    """account:* 模型请求的运行时鉴权（interaction/requestProviderRuntimeHeaders，zun schema）。"""
+    if not provider_id or not str(provider_id).startswith("account:"):
+        return None
+    pr = _d(params)
     _, rules, _ = _builtin_zhipu_rules()
     legacy = config_provider_id_for(provider_id, rules)
-    family = ("bigmodel" if provider_id.startswith("account:bigmodel")
-              else "zai" if provider_id.startswith("account:zai") else "")
-    # 1) 凭据存储：当前账号的账户 key
+    family, mode = _resolve_account_plan_mode(provider_id, rules, pr.get("accountAccess"))
+    if not family or not mode:
+        return None
+    if mode == "start-plan":
+        tok = _start_plan_token_for_family(family)
+        return {"apiKey": tok} if tok else None
+    if mode not in ("individual-coding-plan", "team-coding-plan"):
+        return None
+
+    expected_scope = pr.get("expectedAccountScope")
+    rejected_fp = pr.get("rejectedProjectTokenFingerprint")
+    reason = str(pr.get("reason") or "model-request")
+    if rejected_fp and not expected_scope:
+        log(f"provider runtime headers: {provider_id} rejected_fp without expectedAccountScope")
+        return None
+
+    mat = _load_oauth_material(family)
+    if mat and mat.get("accessToken"):
+        acct_id = mat.get("accountIdentity") or family
+        team_ctx = None
+        if mode == "team-coding-plan":
+            team_ctx = _resolve_team_context_for_family(family, login_token=mat["accessToken"])
+            if not team_ctx:
+                log(f"provider runtime headers: {provider_id} no active team context")
+                return None
+        include_scope = (reason != "usage") or bool(expected_scope)
+        scope = _compute_account_scope(family, mode, team_ctx, mat) if include_scope else None
+        if expected_scope and scope != expected_scope:
+            log(f"provider runtime headers: {provider_id} accountScope mismatch")
+            return None
+        try:
+            pat, api_key_id = _mint_project_access_token(
+                _family_host(family),
+                family,
+                acct_id,
+                mat["accessToken"],
+                team_ctx=team_ctx,
+                rejected_fp=rejected_fp,
+            )
+            if include_scope:
+                mat_after = _load_oauth_material(family)
+                if not mat_after or _compute_account_scope(family, mode, team_ctx, mat_after) != scope:
+                    clear_project_token_caches()
+                    log(f"provider runtime headers: {provider_id} account changed mid-flight")
+                    return None
+            out = {"apiKey": pat, "apiKeyId": api_key_id}
+            if scope:
+                out["accountScope"] = scope
+            return out
+        except Exception as e:
+            log(f"project access token resolve failed ({provider_id}): {e}")
+            if expected_scope or rejected_fp:
+                return None
+
+    if expected_scope or rejected_fp:
+        return None
+    return _fallback_manual_coding_plan_auth(provider_id, legacy, family)
+
+
+def _normalize_origin_str(parsed):
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname
+    if not host:
+        return None
+    host_fmt = f"[{host}]" if (":" in host and not host.startswith("[")) else host.lower()
     try:
-        with open(os.path.expanduser("~/.zcode/v2/credentials.json")) as f:
-            creds = json.load(f)
-        prefix = f"account-provider:coding-plan:{provider_id}:account:"
-        candidates = [k for k in creds
-                      if k.startswith(prefix) and k.endswith(":api-key")]
-        uid = ""
-        if family:
-            info = zcode_credential(f"oauth:{family}:user_info")
-            if info:
-                try:
-                    uid = str((json.loads(info) or {}).get("id") or "")
-                except Exception:
-                    uid = ""
-        if uid:
-            hit = f"{prefix}{uid}:api-key"
-            if hit in candidates:
-                key = zcode_credential(hit)
-                if key:
-                    return {"apiKey": key}
-        for name in candidates:
-            key = zcode_credential(name)
-            if key:
-                return {"apiKey": key}
-    except Exception:
-        pass
-    # 2) legacy config.json 的 plan key
+        port = parsed.port
+    except ValueError:
+        return None
+    if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+        port = None
+    return f"{scheme}://{host_fmt}" + (f":{port}" if port is not None else "")
+
+
+def _normalize_https_origin(raw):
     try:
-        with open(os.path.expanduser("~/.zcode/v2/config.json")) as f:
-            v2 = json.load(f)
-        key = (((v2.get("provider") or {}).get(legacy) or {}).get("options")
-               or {}).get("apiKey")
-        if key:
-            return {"apiKey": key}
+        p = urllib.parse.urlparse(str(raw or "").strip())
     except Exception:
-        pass
-    # 3) 业务 JWT
-    jwt = zcode_credential("zcodejwttoken")
-    if jwt:
-        return {"apiKey": jwt}
-    return None
+        return None
+    if p.username is not None or p.password is not None:
+        return None
+    if p.scheme.lower() != "https" or not p.hostname:
+        return None
+    return _normalize_origin_str(p)
+
+
+def _normalize_loopback_origin(raw):
+    try:
+        p = urllib.parse.urlparse(str(raw or "").strip())
+    except Exception:
+        return None
+    if p.username is not None or p.password is not None:
+        return None
+    if p.scheme.lower() != "http":
+        return None
+    if (p.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+        return None
+    return _normalize_origin_str(p)
+
+
+def _trusted_official_mcp_origins():
+    origins = {"https://zcode.z.ai"}
+    settings = _read_zcode_settings()
+    for ep in (
+        os.environ.get("ZCODE_ENDPOINT_ORIGIN"),
+        os.environ.get("ZCODE_BASE_URL"),
+        settings.get("zcodeEndpointOrigin"),
+    ):
+        norm = _normalize_https_origin(ep)
+        if norm:
+            origins.add(norm)
+    dev_raw = (os.environ.get("ZCODE_OFFICIAL_MCP_DEV_TRUSTED_ORIGINS") or "").strip()
+    if dev_raw:
+        for item in dev_raw.split(","):
+            norm = _normalize_loopback_origin(item)
+            if norm:
+                origins.add(norm)
+    return origins
+
+
+def handle_official_mcp_auth_headers(params):
+    """应答 interaction/requestOfficialMcpAuthHeaders（对齐 ZCode 3.18.2 tct / JN / rze schema）。"""
+    p = _d(params)
+    raw_origin = str(p.get("targetOrigin") or "").strip()
+    norm_origin = _normalize_loopback_origin(raw_origin) or _normalize_https_origin(raw_origin) or ""
+    if not norm_origin or norm_origin not in _trusted_official_mcp_origins():
+        return {"ok": False, "reason": "official_mcp_origin_untrusted"}
+    jwt = (zcode_credential("zcodejwttoken") or "").strip()
+    jwt = re.sub(r"^Bearer\s+", "", jwt, flags=re.I).strip()
+    if not jwt:
+        return {"ok": False, "reason": "official_auth_unavailable"}
+    consumer = str(p.get("consumer") or "mcp-server").strip()
+    settings = _read_zcode_settings()
+    active_fam = str(settings.get("providerFamilyDomain") or "").strip()
+    if active_fam not in ("zai", "bigmodel"):
+        ap = (zcode_credential("oauth:active_provider") or "").strip()
+        active_fam = "bigmodel" if ap == "bigmodel" else "zai"
+    sel = _d(_d(settings.get("providerFamilyConnectionSelections")).get(active_fam))
+    sel_kind = str(sel.get("kind") or "individual-coding-plan").strip()
+    if sel_kind not in ("individual-coding-plan", "team-coding-plan"):
+        if consumer == "plugin-command":
+            return {"ok": True, "headers": {"Authorization": f"Bearer {jwt}"}}
+        return {"ok": False, "reason": "official_auth_plan_required"}
+    mat = _load_oauth_material(active_fam)
+    if mat and mat.get("accessToken"):
+        headers = {
+            "Authorization": f"Bearer {jwt}",
+            "X-Bigmodel-Authorization": f"Bearer {mat['accessToken']}",
+        }
+        if sel_kind == "team-coding-plan":
+            tctx = _resolve_team_context_for_family(active_fam)
+            if tctx and tctx.get("organizationId") and tctx.get("projectId"):
+                if active_fam == "bigmodel":
+                    headers["Bigmodel-Target-Type"] = "TEAM"
+                    headers["Bigmodel-Organization"] = str(tctx["organizationId"])
+                    headers["Bigmodel-Project"] = str(tctx["projectId"])
+                return {"ok": True, "headers": headers}
+            if consumer == "plugin-command":
+                return {"ok": True, "headers": {"Authorization": f"Bearer {jwt}"}}
+            return {"ok": False, "reason": "official_auth_plan_required"}
+        headers["Bigmodel-Target-Type"] = "PERSONAL"
+        return {"ok": True, "headers": headers}
+    if consumer == "plugin-command":
+        return {"ok": True, "headers": {"Authorization": f"Bearer {jwt}"}}
+    return {"ok": False, "reason": "official_auth_unavailable"}
 
 
 def _levels_from_v2(model_id):
@@ -821,9 +1935,11 @@ def zcode_model_catalog(current_mode="default", current_thought=None,
         entitled = entitled_builtin_providers(live_entitled)
         for rule in zhipu_rules:
             pid = rule.get("providerId") or ""
+            cfg3 = rule.get("config") or {}
+            if cfg3.get("visibility") == "hidden":
+                continue
             if config_provider_id_for(pid, zhipu_rules) not in entitled:
                 continue
-            cfg3 = rule.get("config") or {}
             fam = ((cfg3.get("access") or {}).get("accountType") or "")
             brand = {"zai": "Z.AI", "bigmodel": "BigModel"}.get(fam)
             pname = (rule.get("providerName") or pid).strip()
@@ -900,6 +2016,29 @@ def zcode_model_catalog(current_mode="default", current_thought=None,
                 "totalContextTokens": entry.get("contextWindow") or None,
                 "supportsReasoningEffort": True,
             })
+        if account_entries:
+            # 引擎 nit.resolve 仅物化 current!==False 的单个 account-plan；
+            # 把其余已获权益的非隐藏 account:* 补回目录，保证 ACP 可见可切换。
+            seen_refs = {(v[0], v[1]) for v in new_alias.values()}
+            extra_acct = []
+            for ae in account_entries:
+                val = ae.get("modelId")
+                ref_t = alias.get(val)
+                if not val or not ref_t:
+                    continue
+                if (ref_t[0], ref_t[1]) in seen_refs or val in new_alias:
+                    continue
+                new_alias[val] = ref_t
+                seen_refs.add((ref_t[0], ref_t[1]))
+                extra_acct.append(dict(ae))
+            if extra_acct:
+                last_acct_idx = -1
+                for idx, item in enumerate(new_avail):
+                    ref_i = new_alias.get(item.get("modelId"))
+                    if ref_i and str(ref_i[0]).startswith("account:"):
+                        last_acct_idx = idx
+                insert_at = last_acct_idx + 1 if last_acct_idx >= 0 else len(new_avail)
+                new_avail[insert_at:insert_at] = extra_acct
         if new_avail:
             new_current = None
             if prev_ref:
@@ -1288,8 +2427,13 @@ def engine_env():
         log(f"engine provider env: builtin={builtin}")
     personal = resolve_personal_provider_config()
     if personal:
-        env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = personal
-        log(f"engine provider env: personal={personal}")
+        env.setdefault("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", personal)
+        log(f"engine provider env: personal="
+            f"{env['ZCODE_PERSONAL_PROVIDER_CONFIG_FILE']}")
+    app_ver = zcode_app_version()
+    if app_ver and app_ver != "0.0.0":
+        env.setdefault("ZCODE_APP_VERSION", app_ver)
+    env.setdefault("ZCODE_CLIENT_LANGUAGE", zcode_client_language())
     return env
 
 
@@ -1392,6 +2536,7 @@ class ZCode:
         self.mcp_servers = []
         self.account_pushed = False   # 订阅快照是否已推给本引擎进程
         self.live_entitled = None     # 本会话现场查到的权益（session/new 注入）
+        self.current_account_pid = None  # 当前在引擎内标为 current=True 的 account-plan
         self.workspace = None    # {workspacePath, workspaceKey} — 子会话激活(resume)要用
         # V4 网关(桌面同款实时通道):子会话的 token 级流只能从这里拿。
         # 见 _v4_frame 注释。
@@ -1422,6 +2567,7 @@ class ZCode:
         # 本会话的第一条 `session/event` 稳定晚于 session 行 100~120ms，
         # 是协议面上可用的"已落盘"确定信号。
         self._persisted = threading.Event()
+        self._inbox_wake = threading.Event()
         self.on_stop = None        # 取消时：结算已挂在客户端的权限请求
         self.on_cancel_tasks = None  # 取消时：best-effort 停掉子代理后台任务
         self.child_lock = threading.RLock()   # V4 帧(读者线程) / 轮询(主线程) 共改子会话状态
@@ -1440,6 +2586,11 @@ class ZCode:
             self.proc.stdin.write((json.dumps(obj) + "\n").encode())
             self.proc.stdin.flush()
 
+    def enable_network_capture(self, capture_id):
+        """启用/关闭引擎内置网络观测（process/networkCapture → process/networkRequests）。"""
+        self._send({"method": "process/networkCapture",
+                    "params": {"captureId": capture_id}})
+
     def _read_loop(self):
         for line in self.proc.stdout:
             try:
@@ -1449,6 +2600,8 @@ class ZCode:
             cb = None
             with self.lock:
                 self.log.append(msg)
+            if msg.get("method") and msg.get("id") is not None:
+                self._inbox_wake.set()
             if msg.get("method") == "session/event":
                 # 本会话的第一条事件 = 引擎已经把 session 行写进库（见
                 # __init__ 里 _persisted 的注释）。这里在读者线程最早的位置
@@ -1487,11 +2640,29 @@ class ZCode:
                 except Exception as e:
                     log(f"event dispatch failed: {e}")
 
+    def _answer_provider_runtime_headers(self, mid, params):
+        pr = _d(params)
+        msel = _d(pr.get("modelSelection"))
+        pid = msel.get("providerId") or pr.get("providerId") or ""
+        model_id = msel.get("modelId") or ""
+        auth = coding_plan_request_auth(pid, pr)
+        if auth:
+            log(f"provider runtime headers: {pid}/{model_id} "
+                f"reason={pr.get('reason')} → 供鉴权")
+            self._send({"id": mid, "result": {
+                "headersApplied": True, "requestAuth": auth}})
+        else:
+            log(f"provider runtime headers: {pid}/{model_id} 无鉴权可用 → 拒绝")
+            self._send({"id": mid, "result": {
+                "headersApplied": False,
+                "errorMessage": f"zcode-acp: no runtime auth for {pid}"}})
+
     def _autoanswer_loop(self):
         answered = set()
         pending_decisions = {}   # requestId -> None(决策中)|decision
         latest_mid = {}          # requestId -> 最新公告的 server 请求 id（应答必须回最新）
         while True:
+            self._inbox_wake.clear()
             with self.lock:
                 snapshot = list(self.log)
             for m in snapshot:
@@ -1502,54 +2673,77 @@ class ZCode:
                     if key in answered:
                         continue
                     answered.add(key)
+                    params = _d(m.get("params"))
                     if method == "session/requestRuntimePreferences":
-                        self._send({"id": mid, "result": {"nativeSearchEnhancementsEnabled": False}})
+                        self._send({"id": mid, "result": {
+                            "nativeSearchEnhancementsEnabled": False,
+                            "toolSearchMode": "off",
+                            "subagentRuntimeConfigEnabled": False,
+                            "appControlEnabled": False,
+                            "memoryEnabled": False,
+                            "askUserQuestionAutoResolutionEnabled": True,
+                            "modelContextBudgetStrategy": "preflight-v1",
+                        }})
+                    elif method == "subagents/readRuntimeConfig":
+                        self._send({"id": mid, "result": {"kind": "built-in-fallback"}})
                     elif method == "interaction/requestOfficialMcpAuthHeaders":
-                        self._send({"id": mid, "result": {"headersApplied": False}})
+                        self._send({"id": mid, "result": handle_official_mcp_auth_headers(params)})
+                    elif method == "interaction/requestCredentialCipher":
+                        self._send({"id": mid, "result": handle_credential_cipher_request(params)})
                     elif method == "interaction/requestProviderRuntimeHeaders":
-                        # 订阅（zhipu-account）模型请求前引擎必向宿主要鉴权素材；
-                        # 不应答/答 false 会 -32031 重试风暴（社区实测）。
-                        # 注意：mid 是应答用的请求 id，别被 modelId 变量遮蔽！
-                        pr = m.get("params") or {}
-                        msel = pr.get("modelSelection") or {}
-                        pid = msel.get("providerId") or pr.get("providerId") or ""
-                        model_id = msel.get("modelId") or ""
-                        auth = coding_plan_request_auth(pid)
-                        if auth:
-                            log(f"provider runtime headers: {pid}/{model_id} "
-                                f"reason={pr.get('reason')} → 供鉴权")
-                            self._send({"id": mid, "result": {
-                                "headersApplied": True, "requestAuth": auth}})
-                        else:
-                            log(f"provider runtime headers: {pid}/{model_id} 无鉴权可用 → 拒绝")
-                            self._send({"id": mid, "result": {
-                                "headersApplied": False,
-                                "errorMessage": f"zcode-acp: no runtime auth for {pid}"}})
+                        threading.Thread(
+                            target=self._answer_provider_runtime_headers,
+                            args=(mid, dict(params)),
+                            daemon=True,
+                        ).start()
+                    elif method == "interaction/browserList":
+                        self._send({"id": mid, "result": {"browsers": []}})
+                    elif method == "interaction/browserExecute":
+                        cmd = _d(params.get("command"))
+                        scope_id = params.get("controlScopeId")
+                        res = {
+                            "ok": False,
+                            "error": {"code": "backend_unavailable",
+                                      "message": "browser control not available"},
+                            "elapsedMs": 0,
+                        }
+                        if cmd.get("method") == "openScope" and scope_id:
+                            res["scope"] = {"id": scope_id, "state": "rejected"}
+                        self._send({"id": mid, "result": res})
+                    elif method == "automation/list":
+                        self._send({"id": mid, "result": {"automations": []}})
+                    elif method == "automation/checkTaskBinding":
+                        self._send({"id": mid, "result": {"bound": False}})
+                    elif method == "offPeak/list":
+                        self._send({"id": mid, "result": {"tasks": []}})
                     elif method == "interaction/requestPermission":
                         # 重发公告（reannounceIntervalMs=1s）共用同一 requestId：
                         # 决策一次，应答永远回最新公告的 server id
-                        rid = m["params"].get("requestId")
+                        rid = params.get("requestId")
                         latest_mid[rid] = mid
                         if rid not in pending_decisions:
                             pending_decisions[rid] = None
                             threading.Thread(target=self._decide_permission,
-                                             args=(m["params"], pending_decisions, rid),
+                                             args=(params, pending_decisions, rid),
                                              daemon=True).start()
                     elif method == "interaction/requestUserInput":
                         # 询问用户（AskUserQuestion 形状）→ ui_cb 转发 ACP
                         # elicitation/create。线程内等待,不堵自动应答循环。
                         threading.Thread(target=self._decide_user_input,
-                                         args=(dict(m["params"]), mid),
+                                         args=(dict(params), mid),
                                          daemon=True).start()
                     else:
-                        self._send({"id": mid, "result": {}})
+                        self._send({"id": mid, "error": {
+                            "code": -32601,
+                            "message": f"Unsupported ZCode Protocol request: {method}",
+                        }})
             for rid, d in list(pending_decisions.items()):
                 mid = latest_mid.get(rid)
                 if d and mid is not None:
                     self.answer_permission(mid, d)
                     pending_decisions.pop(rid, None)
                     latest_mid.pop(rid, None)
-            time.sleep(0.3)
+            self._inbox_wake.wait(0.15)
 
     def _decide_user_input(self, params, mid):
         """询问用户：ui_cb(params) → 引擎应答 {action, content} / {action:"decline"}。"""
@@ -1599,6 +2793,7 @@ class ZCode:
             decision = "allow"
         if decision is not None:
             pending_decisions[rid] = decision
+            self._inbox_wake.set()
             log(f"decision {rid} {tool_name} -> {decision} (mode={mode})")
             return
         # ⚠️ turn 已结束（用户点了终止 / 轮已收尾）时，引擎侧的子代理/工具
@@ -1627,6 +2822,7 @@ class ZCode:
                     f"(turn ended while waiting)")
             decision = "deny"
         pending_decisions[rid] = decision
+        self._inbox_wake.set()
         log(f"decision {rid} {tool_name} -> {decision}")
 
     def create_session(self):
@@ -2967,16 +4163,21 @@ class ZCode:
             ch["state_sent"] = True
             subagent_cb("state", zid, {"state": "failed"})
 
-    def _push_account_config(self, force=False):
+    def _push_account_config(self, force=False, current_account_pid=None):
         """会话前把订阅快照推给引擎（桌面宿主 provider/updateAccountConfig）。
 
         没有宿主推送时 account:* 渠道不进注册表——订阅模型不出现、也切不过去。
         必须在 session/create 之前推：create 会对会话的模型选择做在册校验。
-        每个引擎进程推一次即可（resume 走新引擎时会补推）。"""
+        每个引擎进程推一次即可（resume 走新引擎或跨 account-plan 切换时会补推）。"""
         if self.account_pushed and not force:
             return
         try:
-            payload = build_account_provider_payload(getattr(self, "live_entitled", None))
+            target_pid = (current_account_pid if current_account_pid is not None
+                          else getattr(self, "current_account_pid", None))
+            payload = build_account_provider_payload(
+                getattr(self, "live_entitled", None),
+                current_account_pid=target_pid,
+            )
             if not payload:
                 return
             r = self.engine_call_raw("provider/updateAccountConfig", payload, timeout=10)
@@ -2984,10 +4185,16 @@ class ZCode:
                 self.account_pushed = True
             if isinstance(r, dict) and isinstance(r.get("result"), dict):
                 res = r["result"]
+                active_plan = next(
+                    (pid for pid, st in (payload.get("states") or {}).items()
+                     if st.get("current") is True and _is_account_coding_plan(pid)),
+                    None,
+                )
+                self.current_account_pid = active_plan
                 ent = [pid for pid, st in (payload.get("states") or {}).items()
                        if st.get("entitled")]
                 log(f"account snapshot pushed: providers={res.get('providerCount')} "
-                    f"status={res.get('status')} entitled={ent}")
+                    f"status={res.get('status')} entitled={ent} current_plan={active_plan}")
             elif isinstance(r, dict) and r.get("error"):
                 log("account snapshot push failed: "
                     f"{json.dumps(r['error'], ensure_ascii=False)[:200]}")
@@ -2997,6 +4204,9 @@ class ZCode:
     def _set_model(self, provider_id, model_id, level=None, wait=5):
         """带推理档位的 setModel（引擎 3.12+ 对有档位模型强制要求 options；
         account:* 模型无 specs 时引擎也强制要求——model_selection 会解析出来）。"""
+        if (_is_account_coding_plan(provider_id)
+                and getattr(self, "current_account_pid", None) != provider_id):
+            self._push_account_config(force=True, current_account_pid=provider_id)
         rid = self.next_id; self.next_id += 1
         self._send({"id": rid, "method": "session/setModel",
                     "params": {"sessionId": self.session_id,
@@ -3244,11 +4454,8 @@ class ZCode:
         # ③ 原地复活（同一个 sessionId，客户端无感）
         ws = dict(self.workspace or {"workspacePath": self.cwd,
                                      "workspaceKey": "acp-" + uuid.uuid4().hex[:8]})
-        registry = _v2_registry()
-        if registry:
-            self.engine_call("workspace/updateProviderRegistry",
-                             {"workspace": dict(ws), "registry": registry},
-                             timeout=30)
+        self.engine_call("provider/refreshRegistry", {"reason": "hard_stop_resume"},
+                         timeout=10)
         rp = {"sessionId": self.session_id, "workspace": ws}
         if self.mcp_servers:
             rp["mcpServers"] = self.mcp_servers   # per-load 配置：复活时必须重挂
@@ -3534,6 +4741,11 @@ class AcpServer:
                 "agentCapabilities": {"loadSession": False,
                                        "promptCapabilities": {"embeddedContext": False}},
                 "sessionCapabilities": {"list": {}, "resume": {}, "fork": {}, "close": {}},
+                # agentInfo（ACP schema 的 Implementation）：编排层按 name 给
+                # 适配器选政策（codeg 的 steering 白名单按它匹配），version 供
+                # "跑着的到底是不是这个版本"的运行时证明；两者都取自本包自身
+                # 的元数据，不硬编码。
+                "agentInfo": {"name": "zcode-acp", "version": adapter_version()},
                 "authMethods": AUTH_METHODS,
                 # steering 扩展广告（顶层 _meta，与 claude-agent-acp / codex-acp
                 # 同位置）。supported 之外的字段是本适配器实测出来的投递事实，
@@ -3742,6 +4954,9 @@ class AcpServer:
                 self._send({"jsonrpc": "2.0", "id": rid, "error":
                             {"code": -32602, "message": "modelId must be provider/model"}})
                 return
+            if (_is_account_coding_plan(prov)
+                    and getattr(self.zcode, "current_account_pid", None) != prov):
+                self.zcode._push_account_config(force=True, current_account_pid=prov)
             zrid = self.zcode.next_id; self.zcode.next_id += 1
             self.zcode._send({"id": zrid, "method": "session/setModel",
                               "params": {"sessionId": self.zcode.session_id,
@@ -4466,16 +5681,10 @@ class AcpServer:
                 if s.get("sessionId") == zsid and s.get("workspace"):
                     ws = s["workspace"]
                     break
-            # 前置:把 v2 渠道推给工作区(恢复 provider 注册表)
-            # 注：本引擎（3.15.x）没有 workspace/updateProviderRegistry 这个方法，
-            # 调用只会拿到 method-not-found；保留只是为了兼容旧引擎的残留路径。
-            registry = _v2_registry()
-            if registry:
-                rr = zc.engine_call("workspace/updateProviderRegistry",
-                                    {"workspace": dict(ws), "registry": registry},
-                                    timeout=30)
-                if rr and rr.get("status") not in ("applied", "unchanged"):
-                    log(f"registry push status: {rr.get('status')}")
+            # 前置：触发引擎刷新 Provider Registry（3.15+ 由 personal + account 表驱动，
+            # 旧版 workspace/updateProviderRegistry 已移除并恒回 -32601）。
+            zc.engine_call("provider/refreshRegistry", {"reason": "session_resume"},
+                           timeout=10)
             mcp = params.get("mcpServers")
             if isinstance(mcp, list) and mcp:
                 zc.mcp_servers = engine_mcp_servers(mcp)

@@ -63,6 +63,8 @@ def check(model, budget=60):
         nid[0] += 1
         return nid[0]
 
+    import zcode_acp as bridge
+
     def reader():
         for line in proc.stdout:
             try:
@@ -77,14 +79,33 @@ def check(model, budget=60):
                     if mid in answered:
                         continue
                     answered.add(mid)
-                r = {"id": mid, "result": {}}
+                pr = m.get("params") or {}
                 if me == "session/requestRuntimePreferences":
-                    r["result"] = {"nativeSearchEnhancementsEnabled": False}
+                    send({"id": mid, "result": {
+                        "nativeSearchEnhancementsEnabled": False,
+                        "toolSearchMode": "off",
+                        "subagentRuntimeConfigEnabled": False,
+                        "appControlEnabled": False,
+                        "memoryEnabled": False,
+                        "askUserQuestionAutoResolutionEnabled": True,
+                        "modelContextBudgetStrategy": "preflight-v1",
+                    }})
                 elif me == "interaction/requestOfficialMcpAuthHeaders":
-                    r["result"] = {"headersApplied": False}
+                    send({"id": mid, "result": bridge.handle_official_mcp_auth_headers(pr)})
+                elif me == "interaction/requestCredentialCipher":
+                    send({"id": mid, "result": bridge.handle_credential_cipher_request(pr)})
+                elif me == "interaction/requestProviderRuntimeHeaders":
+                    msel = pr.get("modelSelection") or {}
+                    p_id = msel.get("providerId") or pr.get("providerId") or ""
+                    auth = bridge.coding_plan_request_auth(p_id, pr)
+                    if auth:
+                        send({"id": mid, "result": {"headersApplied": True, "requestAuth": auth}})
+                    else:
+                        send({"id": mid, "result": {"headersApplied": False, "errorMessage": "no auth"}})
                 elif me == "interaction/requestPermission":
-                    r["result"] = {"decision": "allow"}
-                send(r)
+                    send({"id": mid, "result": {"decision": "allow"}})
+                else:
+                    send({"id": mid, "error": {"code": -32601, "message": "unsupported"}})
 
     threading.Thread(target=reader, daemon=True).start()
 
@@ -102,6 +123,11 @@ def check(model, budget=60):
 
     try:
         rpc("initialize", {"protocolVersion": 1, "clientCapabilities": {}}, 30)
+        pid, _, mid = model.partition("/")
+        if pid.startswith("account:"):
+            acct_payload = bridge.build_account_provider_payload(current_account_pid=pid)
+            if acct_payload:
+                rpc("provider/updateAccountConfig", acct_payload, 15)
         rpc("session/create", {"workspace": {
             "workspacePath": cwd,
             "workspaceKey": "probe-" + uuid.uuid4().hex[:8]}}, 60)
@@ -112,9 +138,8 @@ def check(model, budget=60):
                     sid = (m.get("params") or {}).get("sessionId")
         if not sid:
             return "FAIL no session"
-        pid, _, mid = model.partition("/")
         rpc("session/setModel",
-            {"sessionId": sid, "model": {"providerId": pid, "modelId": mid}}, 30)
+            {"sessionId": sid, "model": bridge.model_selection(pid, mid)}, 30)
         rpc("session/subscribe", {"sessionId": sid,
                                   "deliveryKind": "desktop-continuous",
                                   "includeSnapshot": False})
